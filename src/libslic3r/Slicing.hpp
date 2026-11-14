@@ -13,6 +13,7 @@
 #include <set>
 #include <type_traits>
 #include <vector>
+#include <algorithm>
 #include <utility>
 #include <cassert>
 
@@ -117,6 +118,17 @@ struct SlicingParameters
     coordf_t 	object_print_z_uncompensated_max { 0 };
     // Scaling factor for compensating shrinkage in Z-axis.
     coordf_t    object_shrinkage_compensation_z { 0 };
+
+    // ColorMax engine: repeating layer heights above the first layer (variable layer thickness).
+    // When layer_schedule_size > 0 it replaces the layer height profile.
+    static constexpr size_t MAX_LAYER_SCHEDULE = 16;
+    coordf_t    layer_schedule[MAX_LAYER_SCHEDULE] {};
+    size_t      layer_schedule_size { 0 };
+    void        set_layer_schedule(const std::vector<double> &heights) {
+        layer_schedule_size = std::min(heights.size(), MAX_LAYER_SCHEDULE);
+        for (size_t i = 0; i < layer_schedule_size; ++ i)
+            layer_schedule[i] = heights[i];
+    }
 };
 static_assert(IsTriviallyCopyable<SlicingParameters>::value, "SlicingParameters class is not POD (and it should be - see constructor).");
 

@@ -13,6 +13,12 @@
 #include "libslic3r/Semver.hpp"
 #include "libslic3r/Time.hpp"
 #include "libslic3r/Feature/FullSpectrum/VirtualExtruder.hpp"
+#include "libslic3r/Feature/ColorMix/ModelData.hpp"
+#include "libslic3r/Feature/ColorMix/ModelConvert.hpp"
+#include "libslic3r/Feature/ColorMix/ColorSpace.hpp"
+#include "libslic3r/TriangleSelector.hpp"
+#include <nlohmann/json.hpp>
+#include <set>
 
 #include "libslic3r/I18N.hpp"
 
@@ -141,6 +147,9 @@ static constexpr const char* CUSTOM_SUPPORTS_ATTR = "slic3rpe:custom_supports";
 static constexpr const char* CUSTOM_SEAM_ATTR = "slic3rpe:custom_seam";
 static constexpr const char* MM_SEGMENTATION_ATTR = "slic3rpe:mmu_segmentation";
 static constexpr const char* FUZZY_SKIN_ATTR = "slic3rpe:fuzzy_skin";
+static constexpr const char* COLORMIX_SOURCE_ATTR = "slic3rpe:colormix_source";
+static const std::string BAMBU_MODEL_SETTINGS_FILE   = "Metadata/model_settings.config";
+static const std::string BAMBU_PROJECT_SETTINGS_FILE = "Metadata/project_settings.config";
 
 static constexpr const char* KEY_ATTR = "key";
 static constexpr const char* VALUE_ATTR = "value";
@@ -383,6 +392,7 @@ namespace Slic3r {
             std::vector<std::string> custom_seam;
             std::vector<std::string> mm_segmentation;
             std::vector<std::string> fuzzy_skin;
+            std::vector<std::string> colormix_source;
 
             bool empty() { return vertices.empty() || triangles.empty(); }
 
@@ -393,6 +403,7 @@ namespace Slic3r {
                 custom_seam.clear();
                 mm_segmentation.clear();
                 fuzzy_skin.clear();
+                colormix_source.clear();
             }
         };
 
@@ -576,6 +587,23 @@ namespace Slic3r {
         bool _extract_model_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, Model& model);
         void _extract_embossed_svg_shape_file(const std::string &filename, mz_zip_archive &archive, const mz_zip_archive_file_stat &stat);
         void _extract_full_spectrum_from_archive(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat, Model &model);
+        // ColorMax engine: project data, and colors of models made by other applications.
+        void _extract_colormix_from_archive(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat, Model &model);
+        void _extract_bambu_model_settings(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat);
+        void _extract_bambu_project_settings(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat);
+        void _apply_source_colors(ModelObject &object, int source_object_id, const PathId &source_path_id);
+        std::map<PathId, std::vector<std::string>> m_basematerials;      // basematerials id -> display colors
+        PathId                                     m_curr_basematerials { std::string(), -1 };
+        std::map<PathId, std::pair<int, int>>      m_object_material;    // object -> (pid, pindex)
+        std::map<int, unsigned int>                m_bambu_part_extruder; // Bambu part (object) id -> 1-based filament
+        std::vector<std::string>                   m_bambu_filament_colours;
+        std::vector<std::string>                   m_source_colors;      // 1-based slots, [0] unused
+        std::map<PathId, unsigned int>             m_basematerials_offset; // group -> slot of its first entry - 1
+        // Objects of a model from another application with their source color slot (0 = none) and
+        // whether they carry paint; applied at the end of loading, only for multi-color models.
+        struct PendingSourceColor { ModelObject *object; unsigned int slot; bool painted; };
+        std::vector<PendingSourceColor>            m_pending_source_colors;
+        void _apply_pending_source_colors(Model &model);
 
         // handlers to parse the .rels file
         void _handle_start_relationships_element(const char* name, const char** attributes);
@@ -690,6 +718,14 @@ namespace Slic3r {
         m_fuzzy_skin_painting_version = 0;
         m_mm_painting_version = 0;
         m_check_version = check_version;
+        m_basematerials.clear();
+        m_curr_basematerials = { std::string(), -1 };
+        m_object_material.clear();
+        m_bambu_part_extruder.clear();
+        m_bambu_filament_colours.clear();
+        m_source_colors.clear();
+        m_basematerials_offset.clear();
+        m_pending_source_colors.clear();
         m_model = &model;
         m_unit_factor = 1.0f;
         m_curr_object.reset();
@@ -862,6 +898,15 @@ namespace Slic3r {
                 else if (boost::algorithm::iequals(name, FULL_SPECTRUM_CONFIG_FILE)) {
                     _extract_full_spectrum_from_archive(archive, stat, model);
                 }
+                else if (boost::algorithm::iequals(name, ColorMix::MODEL_DATA_3MF_FILE)) {
+                    _extract_colormix_from_archive(archive, stat, model);
+                }
+                else if (boost::algorithm::iequals(name, BAMBU_MODEL_SETTINGS_FILE)) {
+                    _extract_bambu_model_settings(archive, stat);
+                }
+                else if (boost::algorithm::iequals(name, BAMBU_PROJECT_SETTINGS_FILE)) {
+                    _extract_bambu_project_settings(archive, stat);
+                }
             }
         }
 
@@ -999,6 +1044,10 @@ namespace Slic3r {
             if (!_generate_volumes(*model_object, obj_geometry->second, *volumes_ptr, config_substitutions))
                 return false;
 
+            if (obj_metadata == m_objects_metadata.end())
+                // Not a PrusaSlicer project: keep the colors the model was designed with.
+                _apply_source_colors(*model_object, object.first.second, object.first);
+
             // Apply cut information for object if any was loaded
             // m_cut_object_ids are indexed by a 1 based model object index.
             IdToCutObjectInfoMap::iterator cut_object_info = m_cut_object_infos.find(object.second + 1);
@@ -1058,6 +1107,11 @@ namespace Slic3r {
             const std::string msg = (boost::format(_u8L("The 3MF file does not contain a valid mesh.\n\n\"%1%\"")) % filename).str();
             throw Slic3r::RuntimeError(msg);
         }
+
+        // ColorMax engine: remember the colors of a model made by another application; a project's
+        // pending color slots are kept by object again.
+        ColorMix::pending_slots_from_file(model);
+        _apply_pending_source_colors(model);
 
         return true;
     }
@@ -1594,6 +1648,149 @@ namespace Slic3r {
             m_full_spectrum_config.virtual_extruders);
     }
 
+    static bool read_archive_entry(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat, std::string &buffer)
+    {
+        buffer.assign(static_cast<size_t>(stat.m_uncomp_size), '\0');
+        return stat.m_uncomp_size == 0 || mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, buffer.data(), buffer.size(), 0);
+    }
+
+    void _3MF_Importer::_extract_colormix_from_archive(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat, Model &model)
+    {
+        std::string buffer;
+        if (!read_archive_entry(archive, stat, buffer)) {
+            add_error(std::string("Error reading ") + ColorMix::MODEL_DATA_3MF_FILE + " from archive");
+            return;
+        }
+        std::string error;
+        if (!ColorMix::model_data_from_json(buffer, model.colormix, &error)) {
+            BOOST_LOG_TRIVIAL(error) << ColorMix::MODEL_DATA_3MF_FILE << ": " << error;
+            // Keep it as it is (written back on save) and let the GUI warn.
+            model.colormix.unreadable_json = buffer;
+        }
+    }
+
+    void _3MF_Importer::_extract_bambu_model_settings(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat)
+    {
+        std::string buffer;
+        if (!read_archive_entry(archive, stat, buffer))
+            return;
+        try {
+            namespace pt = boost::property_tree;
+            pt::ptree tree;
+            std::istringstream in(buffer);
+            pt::read_xml(in, tree);
+            auto extruder_of = [](const pt::ptree &node) -> unsigned int {
+                for (const auto &child : node)
+                    if (child.first == "metadata" && child.second.get<std::string>("<xmlattr>.key", "") == "extruder")
+                        return child.second.get<unsigned int>("<xmlattr>.value", 0);
+                return 0;
+            };
+            for (const auto &obj : tree.get_child("config")) {
+                if (obj.first != "object")
+                    continue;
+                const unsigned int object_extruder = extruder_of(obj.second);
+                const int object_id = obj.second.get<int>("<xmlattr>.id", -1);
+                bool has_parts = false;
+                for (const auto &part : obj.second) {
+                    if (part.first != "part")
+                        continue;
+                    has_parts = true;
+                    const unsigned int e = extruder_of(part.second);
+                    const int part_id = part.second.get<int>("<xmlattr>.id", -1);
+                    if (part_id >= 0 && (e > 0 || object_extruder > 0))
+                        m_bambu_part_extruder[part_id] = e > 0 ? e : object_extruder;
+                }
+                if (!has_parts && object_id >= 0 && object_extruder > 0)
+                    m_bambu_part_extruder[object_id] = object_extruder;
+            }
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << BAMBU_MODEL_SETTINGS_FILE << ": " << e.what();
+        }
+    }
+
+    void _3MF_Importer::_extract_bambu_project_settings(mz_zip_archive &archive, const mz_zip_archive_file_stat &stat)
+    {
+        std::string buffer;
+        if (!read_archive_entry(archive, stat, buffer))
+            return;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(buffer);
+            if (j.contains("filament_colour") && j["filament_colour"].is_array())
+                for (const auto &c : j["filament_colour"]) {
+                    const std::string hex = c.is_string() ? ColorMix::normalize_hex(c.get<std::string>().substr(0, 7)) : std::string();
+                    m_bambu_filament_colours.push_back(hex.empty() ? std::string("#808080") : hex);
+                }
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << BAMBU_PROJECT_SETTINGS_FILE << ": " << e.what();
+        }
+    }
+
+    void _3MF_Importer::_apply_source_colors(ModelObject &object, int source_object_id, const PathId &source_path_id)
+    {
+        unsigned int slot = 0;
+        // model_settings names parts by object id alone: an id that objects of several sub-model files
+        // share is ambiguous (no colors rather than another part's).
+        size_t same_id = 0;
+        for (const auto &[path_id, idx] : m_objects)
+            same_id += path_id.second == source_object_id ? 1 : 0;
+        if (auto it = m_bambu_part_extruder.find(source_object_id); same_id <= 1 && it != m_bambu_part_extruder.end()) {
+            slot = it->second;
+        } else if (auto it_mat = m_object_material.find(source_path_id); it_mat != m_object_material.end()) {
+            const PathId group{ source_path_id.first, it_mat->second.first };
+            const auto   bm = m_basematerials.find(group);
+            if (bm != m_basematerials.end() && it_mat->second.second >= 0 && size_t(it_mat->second.second) < bm->second.size() &&
+                m_bambu_filament_colours.empty()) {
+                // Every basematerials group gets its own run of slots, in the order the groups are used.
+                auto off = m_basematerials_offset.find(group);
+                if (off == m_basematerials_offset.end()) {
+                    if (m_source_colors.empty())
+                        m_source_colors.push_back(std::string());
+                    off = m_basematerials_offset.emplace(group, unsigned(m_source_colors.size() - 1)).first;
+                    append(m_source_colors, bm->second);
+                }
+                slot = off->second + unsigned(it_mat->second.second) + 1;
+            }
+        }
+        if (!m_bambu_filament_colours.empty() && m_source_colors.empty()) {
+            m_source_colors.push_back(std::string());
+            append(m_source_colors, m_bambu_filament_colours);
+        }
+        bool painted = false;
+        for (const ModelVolume *v : object.volumes)
+            painted |= v->is_model_part() && v->is_mm_painted();
+        if (slot >= TRIANGLE_STATE_TYPE_COUNT)
+            slot = 0;
+        m_pending_source_colors.push_back({ &object, slot, painted });
+    }
+
+    void _3MF_Importer::_apply_pending_source_colors(Model &model)
+    {
+        // Only a multi-color model (two or more material slots, or painting) keeps source colors;
+        // single-material files from CAD tools load as usual. Each object prints with its slot's
+        // tool through its extruder setting (like a stock multi-material project); existing paint
+        // is kept as it is. Nothing is painted, so XY size compensation etc. behave as usual.
+        // Counted by color: a file whose objects use several filament slots of the same color (e.g.
+        // two black spools) is a single-color model.
+        std::set<std::string> colors;
+        bool                  any_painted = false;
+        for (const PendingSourceColor &p : m_pending_source_colors) {
+            if (p.slot > 0)
+                colors.insert(p.slot < m_source_colors.size() ? m_source_colors[p.slot] : std::to_string(p.slot));
+            any_painted |= p.painted;
+        }
+        if (m_source_colors.empty() || (colors.size() < 2 && !any_painted)) {
+            m_pending_source_colors.clear();
+            return;
+        }
+        // Recorded only: the GUI assigns the tools (see ModelData::pending_import_slots).
+        for (const PendingSourceColor &p : m_pending_source_colors)
+            if (p.slot > 0)
+                model.colormix.pending_import_slots[p.object->id().id] = p.slot;
+        m_pending_source_colors.clear();
+        if (model.colormix.source_colors.empty())
+            model.colormix.source_colors = m_source_colors;
+    }
+
     bool _3MF_Importer::_extract_model_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, Model& model)
     {
         if (stat.m_uncomp_size == 0) {
@@ -1859,6 +2056,14 @@ namespace Slic3r {
             res = _handle_start_item(attributes, num_attributes);
         else if (::strcmp(METADATA_TAG, name) == 0)
             res = _handle_start_metadata(attributes, num_attributes);
+        else if (::strcmp("basematerials", name) == 0) {
+            // Standard 3MF materials: colors of objects made by other applications (ColorMax engine import).
+            m_curr_basematerials = { m_model_path, get_attribute_value_int(attributes, num_attributes, ID_ATTR) };
+            m_basematerials[m_curr_basematerials].clear();
+        } else if (::strcmp("base", name) == 0 && m_curr_basematerials.second >= 0) {
+            const std::string color = ColorMix::normalize_hex(get_attribute_value_string(attributes, num_attributes, "displaycolor").substr(0, 7));
+            m_basematerials[m_curr_basematerials].push_back(color.empty() ? std::string("#808080") : color);
+        }
 
         if (!res)
             _stop_xml_parser();
@@ -1897,6 +2102,8 @@ namespace Slic3r {
             res = _handle_end_item();
         else if (::strcmp(METADATA_TAG, name) == 0)
             res = _handle_end_metadata();
+        else if (::strcmp("basematerials", name) == 0)
+            m_curr_basematerials = { std::string(), -1 };
 
         if (!res)
             _stop_xml_parser();
@@ -2027,6 +2234,11 @@ namespace Slic3r {
                 m_curr_object.object->name = m_name + "_" + std::to_string(m_model->objects.size());
 
             m_curr_object.id = get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+
+            const std::string pid = get_attribute_value_string(attributes, num_attributes, "pid");
+            if (!pid.empty())
+                m_object_material[{ m_model_path, m_curr_object.id }] = { std::atoi(pid.c_str()),
+                    get_attribute_value_int(attributes, num_attributes, "pindex") };
         }
 
         return true;
@@ -2149,6 +2361,11 @@ namespace Slic3r {
         m_curr_object.geometry.custom_supports.push_back(get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
         m_curr_object.geometry.custom_seam.push_back(get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
         m_curr_object.geometry.fuzzy_skin.push_back(get_attribute_value_string(attributes, num_attributes, FUZZY_SKIN_ATTR));
+        // Sparse: most files have no ColorMix source painting (the loader checks the index).
+        if (std::string colormix_source = get_attribute_value_string(attributes, num_attributes, COLORMIX_SOURCE_ATTR); !colormix_source.empty()) {
+            m_curr_object.geometry.colormix_source.resize(m_curr_object.geometry.custom_supports.size() - 1);
+            m_curr_object.geometry.colormix_source.push_back(std::move(colormix_source));
+        }
 
         // Now load MM segmentation data. Unfortunately, BambuStudio has changed the attribute name after they forked us,
         // leading to https://github.com/prusa3d/PrusaSlicer/issues/12502. Let's try to load both keys if the usual
@@ -2662,6 +2879,7 @@ namespace Slic3r {
             volume->seam_facets.reserve(triangles_count);
             volume->mm_segmentation_facets.reserve(triangles_count);
             volume->fuzzy_skin_facets.reserve(triangles_count);
+            volume->colormix_source_facets.reserve(triangles_count);
             for (size_t i=0; i<triangles_count; ++i) {
                 size_t index = volume_data.first_triangle_id + i;
                 assert(index < geometry.custom_supports.size());
@@ -2672,11 +2890,14 @@ namespace Slic3r {
                 volume->seam_facets.set_triangle_from_string(i, geometry.custom_seam[index]);
                 volume->mm_segmentation_facets.set_triangle_from_string(i, geometry.mm_segmentation[index]);
                 volume->fuzzy_skin_facets.set_triangle_from_string(i, geometry.fuzzy_skin[index]);
+                if (index < geometry.colormix_source.size())
+                    volume->colormix_source_facets.set_triangle_from_string(i, geometry.colormix_source[index]);
             }
             volume->supported_facets.shrink_to_fit();
             volume->seam_facets.shrink_to_fit();
             volume->mm_segmentation_facets.shrink_to_fit();
             volume->fuzzy_skin_facets.shrink_to_fit();
+            volume->colormix_source_facets.shrink_to_fit();
 
             if (auto &es = volume_data.shape_configuration; es.has_value())
                 volume->emboss_shape = std::move(es);            
@@ -2971,6 +3192,21 @@ namespace Slic3r {
             close_zip_writer(&archive);
             boost::filesystem::remove(filename);
             return false;
+        }
+
+        // ColorMax engine project data (or, unchanged, data this build could not read).
+        if (!model.colormix.empty() || !model.colormix.unreadable_json.empty()) {
+            ColorMix::ModelData data = model.colormix;
+            ColorMix::pending_slots_to_file(model, data);
+            // Data this build couldn't read is written back as it was (what else is kept next to it,
+            // e.g. after Delete All, is only a record of colors).
+            const std::string colormix_json = !model.colormix.unreadable_json.empty() ? model.colormix.unreadable_json : ColorMix::model_data_to_json(data);
+            if (!mz_zip_writer_add_mem(&archive, ColorMix::MODEL_DATA_3MF_FILE, colormix_json.data(), colormix_json.size(), MZ_DEFAULT_COMPRESSION)) {
+                add_error(std::string("Unable to add ") + ColorMix::MODEL_DATA_3MF_FILE + " to archive");
+                close_zip_writer(&archive);
+                boost::filesystem::remove(filename);
+                return false;
+            }
         }
 
         if (!mz_zip_writer_finalize_archive(&archive)) {
@@ -3383,6 +3619,15 @@ namespace Slic3r {
                     output_buffer += FUZZY_SKIN_ATTR;
                     output_buffer += "=\"";
                     output_buffer += fuzzy_skin_data_string;
+                    output_buffer += "\"";
+                }
+
+                std::string colormix_source_string = volume->colormix_source_facets.get_triangle_as_string(i);
+                if (!colormix_source_string.empty()) {
+                    output_buffer += " ";
+                    output_buffer += COLORMIX_SOURCE_ATTR;
+                    output_buffer += "=\"";
+                    output_buffer += colormix_source_string;
                     output_buffer += "\"";
                 }
 

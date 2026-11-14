@@ -620,6 +620,22 @@ std::vector<coordf_t> generate_object_layers(
         out.push_back(print_z);
     }
 
+    if (slicing_params.layer_schedule_size > 0) {
+        // ColorMax engine: a fixed repeating schedule of layer heights, so that layer words land on known heights.
+        // Object layer L >= 1 uses schedule[(L - 1) % n]; when the first object layer isn't the fixed
+        // first layer (raft without bridging), it is layer 0 and takes schedule[n - 1].
+        size_t k = slicing_params.first_object_layer_height_fixed() ? 0 : slicing_params.layer_schedule_size - 1;
+        for (;;) {
+            const coordf_t h = slicing_params.layer_schedule[k ++ % slicing_params.layer_schedule_size];
+            if (print_z + 0.5 * h >= slicing_params.object_print_z_height())
+                break;
+            out.push_back(print_z);
+            print_z += h;
+            out.push_back(print_z);
+        }
+        return out;
+    }
+
     const coordf_t shrinkage_compensation_z = slicing_params.object_shrinkage_compensation_z;
     size_t idx_layer_height_profile = 0;
     // loop until we have at least one layer and the max slice_z reaches the object height

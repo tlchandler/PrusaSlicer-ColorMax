@@ -220,6 +220,8 @@ public:
     void toggle_layers_editing(bool enable);
 
     void apply_cut_object_to_model(size_t init_obj_idx, const ModelObjectPtrs& cut_objects);
+    // Adds copies of the objects to the plater (used by the ColorMix calibration plate).
+    std::vector<size_t> add_model_objects(const ModelObjectPtrs& objects);
 
     void with_mocked_fff_background_process(
         Print &print,

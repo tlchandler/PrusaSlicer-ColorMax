@@ -26,6 +26,7 @@
 #include "EmbossShape.hpp"
 #include "TriangleSelector.hpp"
 #include "Feature/FullSpectrum/VirtualExtruder.hpp"
+#include "Feature/ColorMix/ModelData.hpp"
 
 #include <map>
 #include <memory>
@@ -830,6 +831,10 @@ public:
     // List of mesh facets painted for fuzzy skin.
     FacetsAnnotation    fuzzy_skin_facets;
 
+    // ColorMax engine: the painting the model was designed with (source colors), kept so that a
+    // color conversion can be repeated. Not used for slicing.
+    FacetsAnnotation    colormix_source_facets;
+
     // Is set only when volume is Embossed Text type
     // Contain information how to re-create volume
     std::optional<TextConfiguration> text_configuration;
@@ -928,12 +933,14 @@ public:
         this->seam_facets.set_new_unique_id();
         this->mm_segmentation_facets.set_new_unique_id();
         this->fuzzy_skin_facets.set_new_unique_id();
+        this->colormix_source_facets.set_new_unique_id();
     }
 
     bool is_fdm_support_painted() const { return !this->supported_facets.empty(); }
     bool is_seam_painted() const { return !this->seam_facets.empty(); }
     bool is_mm_painted() const { return !this->mm_segmentation_facets.empty(); }
     bool is_fuzzy_skin_painted() const { return !this->fuzzy_skin_facets.empty(); }
+    bool has_colormix_source() const { return !this->colormix_source_facets.empty(); }
 
     // Returns 0-based indices of extruders painted by multi-material painting gizmo.
     std::vector<size_t> get_extruders_from_multi_material_painting() const;
@@ -982,11 +989,13 @@ private:
         assert(this->seam_facets.id().valid());
         assert(this->mm_segmentation_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
+        assert(this->colormix_source_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
         assert(this->id() != this->seam_facets.id());
         assert(this->id() != this->mm_segmentation_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
+        assert(this->id() != this->colormix_source_facets.id());
         return true;
     }
 
@@ -1013,7 +1022,7 @@ private:
         name(other.name), source(other.source), m_mesh(other.m_mesh), m_convex_hull(other.m_convex_hull),
         config(other.config), m_type(other.m_type), object(object), m_transformation(other.m_transformation),
         supported_facets(other.supported_facets), seam_facets(other.seam_facets), mm_segmentation_facets(other.mm_segmentation_facets),
-        fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
+        fuzzy_skin_facets(other.fuzzy_skin_facets), colormix_source_facets(other.colormix_source_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
     {
 		assert(this->id().valid()); 
         assert(this->config.id().valid()); 
@@ -1021,6 +1030,7 @@ private:
         assert(this->seam_facets.id().valid());
         assert(this->mm_segmentation_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
+        assert(this->colormix_source_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
         assert(this->id() != this->seam_facets.id());
@@ -1031,6 +1041,7 @@ private:
         assert(this->seam_facets.id() == other.seam_facets.id());
         assert(this->mm_segmentation_facets.id() == other.mm_segmentation_facets.id());
         assert(this->fuzzy_skin_facets.id() == other.fuzzy_skin_facets.id());
+        assert(this->colormix_source_facets.id() == other.colormix_source_facets.id());
         this->set_material_id(other.material_id());
     }
     // Providing a new mesh, therefore this volume will get a new unique ID assigned.
@@ -1044,11 +1055,13 @@ private:
         assert(this->seam_facets.id().valid());
         assert(this->mm_segmentation_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
+        assert(this->colormix_source_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
         assert(this->id() != this->seam_facets.id());
         assert(this->id() != this->mm_segmentation_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
+        assert(this->id() != this->colormix_source_facets.id());
 		assert(this->id() != other.id());
         assert(this->config.id() == other.config.id());
         this->set_material_id(other.material_id());
@@ -1061,11 +1074,13 @@ private:
         assert(this->seam_facets.id() != other.seam_facets.id());
         assert(this->mm_segmentation_facets.id() != other.mm_segmentation_facets.id());
         assert(this->fuzzy_skin_facets.id() != other.fuzzy_skin_facets.id());
+        assert(this->colormix_source_facets.id() != other.colormix_source_facets.id());
         assert(this->id() != this->config.id());
         assert(this->supported_facets.empty());
         assert(this->seam_facets.empty());
         assert(this->mm_segmentation_facets.empty());
         assert(this->fuzzy_skin_facets.empty());
+        assert(this->colormix_source_facets.empty());
     }
 
     ModelVolume& operator=(ModelVolume &rhs) = delete;
@@ -1073,13 +1088,14 @@ private:
 	friend class cereal::access;
 	friend class UndoRedo::StackImpl;
 	// Used for deserialization, therefore no IDs are allocated.
-	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mm_segmentation_facets(-1), fuzzy_skin_facets(-1), object(nullptr) {
+	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mm_segmentation_facets(-1), fuzzy_skin_facets(-1), colormix_source_facets(-1), object(nullptr) {
 		assert(this->id().invalid());
         assert(this->config.id().invalid());
         assert(this->supported_facets.id().invalid());
         assert(this->seam_facets.id().invalid());
         assert(this->mm_segmentation_facets.id().invalid());
         assert(this->fuzzy_skin_facets.id().invalid());
+        assert(this->colormix_source_facets.id().invalid());
 	}
 	template<class Archive> void load(Archive &ar) {
 		bool has_convex_hull;
@@ -1088,6 +1104,7 @@ private:
         cereal::load_by_value(ar, seam_facets);
         cereal::load_by_value(ar, mm_segmentation_facets);
         cereal::load_by_value(ar, fuzzy_skin_facets);
+        cereal::load_by_value(ar, colormix_source_facets);
         cereal::load_by_value(ar, config);
         cereal::load(ar, text_configuration);
         cereal::load(ar, emboss_shape);
@@ -1107,6 +1124,7 @@ private:
         cereal::save_by_value(ar, seam_facets);
         cereal::save_by_value(ar, mm_segmentation_facets);
         cereal::save_by_value(ar, fuzzy_skin_facets);
+        cereal::save_by_value(ar, colormix_source_facets);
         cereal::save_by_value(ar, config);
         cereal::save(ar, text_configuration);
         cereal::save(ar, emboss_shape);
@@ -1262,6 +1280,8 @@ public:
     ModelObjectPtrs     objects;
     // Virtual extruder definitions. Empty when no virtual extruders are defined.
     FullSpectrum::VirtualExtruders virtual_extruders;
+    // ColorMax engine project data (slice techniques, source colors, last conversion settings).
+    ColorMix::ModelData colormix;
 
     ModelWipeTower& wipe_tower();
     const ModelWipeTower& wipe_tower() const;
@@ -1367,6 +1387,40 @@ private:
 	friend class UndoRedo::StackImpl;
 	template<class Archive> void serialize(Archive &ar) {
 		ar(materials, objects, wipe_tower_vector);
+        // Virtual extruders and ColorMix project data belong to the painting that uses them: undo /
+        // redo must restore them together (kept as their JSON forms).
+        std::string colormix_json, virtual_extruders_json, colormix_unreadable;
+        // Pending import slots, by object / part id (undo / redo keeps the ids).
+        std::vector<size_t>       pending_ids;
+        std::vector<unsigned int> pending_slots;
+        // The JSON form keeps a computed color for gradient blends: their own colors go along here.
+        std::vector<std::string>  ve_colors;
+        std::vector<int>          ve_has_color;
+        if constexpr (Archive::is_saving::value) {
+            colormix_json          = ColorMix::model_data_to_json(colormix);
+            virtual_extruders_json = FullSpectrum::serialize_virtual_extruders_to_json({}, virtual_extruders);
+            colormix_unreadable    = colormix.unreadable_json;
+            for (const auto &[id, slot] : colormix.pending_import_slots) {
+                pending_ids.push_back(id);
+                pending_slots.push_back(slot);
+            }
+            for (const FullSpectrum::VirtualExtruder &ve : virtual_extruders) {
+                ve_has_color.push_back(ve.color.has_value() ? 1 : 0);
+                ve_colors.push_back(ve.color.value_or(std::string()));
+            }
+        }
+        ar(colormix_json, virtual_extruders_json, colormix_unreadable, pending_ids, pending_slots, ve_colors, ve_has_color);
+        if constexpr (Archive::is_loading::value) {
+            ColorMix::ModelData data;
+            colormix          = ColorMix::model_data_from_json(colormix_json, data) ? std::move(data) : ColorMix::ModelData();
+            colormix.unreadable_json = colormix_unreadable;
+            for (size_t i = 0; i < pending_ids.size() && i < pending_slots.size(); ++i)
+                colormix.pending_import_slots[pending_ids[i]] = pending_slots[i];
+            virtual_extruders = FullSpectrum::deserialize_virtual_extruders_from_json(virtual_extruders_json).virtual_extruders;
+            if (ve_colors.size() == virtual_extruders.size() && ve_has_color.size() == virtual_extruders.size())
+                for (size_t i = 0; i < virtual_extruders.size(); ++i)
+                    virtual_extruders[i].color = ve_has_color[i] ? std::optional<std::string>(ve_colors[i]) : std::nullopt;
+        }
     }
 };
 

@@ -99,6 +99,30 @@ set(SLIC3R_SOURCES
     Feature/FuzzySkin/FuzzySkin.hpp
     Feature/FullSpectrum/VirtualExtruder.cpp
     Feature/FullSpectrum/VirtualExtruder.hpp
+    Feature/ColorMix/ColorSpace.cpp
+    Feature/ColorMix/ColorSpace.hpp
+    Feature/ColorMix/Bundle.cpp
+    Feature/ColorMix/Bundle.hpp
+    Feature/ColorMix/Recipes.cpp
+    Feature/ColorMix/Recipes.hpp
+    Feature/ColorMix/Predictor.cpp
+    Feature/ColorMix/Predictor.hpp
+    Feature/ColorMix/Converter.cpp
+    Feature/ColorMix/Converter.hpp
+    Feature/ColorMix/ModelData.cpp
+    Feature/ColorMix/ModelData.hpp
+    Feature/ColorMix/SliceTechniques.cpp
+    Feature/ColorMix/SliceTechniques.hpp
+    Feature/ColorMix/ModelConvert.cpp
+    Feature/ColorMix/ModelConvert.hpp
+    Feature/ColorMix/Calibration.cpp
+    Feature/ColorMix/PhotoCalibration.cpp
+    Feature/ColorMix/FilamentDb.cpp
+    Feature/ColorMix/FilamentDb.hpp
+    Feature/ColorMix/Gamut.cpp
+    Feature/ColorMix/Gamut.hpp
+    Feature/ColorMix/PhotoCalibration.hpp
+    Feature/ColorMix/Calibration.hpp
     Fill/Fill.cpp
     Fill/Fill3DHoneycomb.cpp
     Fill/Fill3DHoneycomb.hpp

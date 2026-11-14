@@ -65,6 +65,9 @@
 #include "PresetComboBoxes.hpp"
 #include "MsgDialog.hpp"
 #include "FullSpectrumDialog.hpp"
+#include "ColorMixDialog.hpp"
+#include "libslic3r/Feature/ColorMix/ModelConvert.hpp"
+#include <nlohmann/json.hpp>
 #include "MainFrame.hpp"
 
 using Slic3r::Preset;
@@ -83,22 +86,28 @@ renumber_virtual_extruders(Plater& plater, unsigned int num_physical, bool take_
 
     std::map<unsigned int, unsigned int> remap;
     unsigned int next_id = num_physical + 1;
-    for (FullSpectrum::VirtualExtruder& ve : model.virtual_extruders) {
-        if (ve.id != next_id) {
+    for (const FullSpectrum::VirtualExtruder& ve : model.virtual_extruders) {
+        if (ve.id != next_id)
             remap[ve.id] = next_id;
-            ve.id        = next_id;
-        }
-
         ++next_id;
     }
 
     if (remap.empty()) {
+        // ColorMix's record of the last conversion still follows the tool count.
+        ColorMix::remap_conversion_record(model.colormix, remap, num_physical);
         return false;
     }
 
+    // The snapshot first: undo must restore ids, painting and the ColorMix record together.
     if (take_snapshot) {
         plater.take_snapshot(_L("Renumber virtual extruders"));
     }
+    for (FullSpectrum::VirtualExtruder& ve : model.virtual_extruders)
+        if (auto it = remap.find(ve.id); it != remap.end())
+            ve.id = it->second;
+    // ColorMix records how its last conversion painted (blend ids): keep that record in step, or
+    // the next Compute would take every converted part for repainted.
+    ColorMix::remap_conversion_record(model.colormix, remap, num_physical);
 
     for (ModelObject* object : model.objects) {
         if (!object) {
@@ -406,6 +415,29 @@ static void hide_rich_tip(wxButton* btn)
 
 // Sidebar / public
 
+void Sidebar::open_colormix_dialog()
+{
+    if (GLCanvas3D *canvas = m_plater->canvas3D(); canvas != nullptr)
+        canvas->reset_all_gizmos();
+    ColorMixDialog dialog(static_cast<wxWindow*>(wxGetApp().mainframe), m_plater);
+    if (dialog.ShowModal() != wxID_OK && !dialog.model_changed())
+        return;
+    update_after_colormix_change();
+}
+
+void Sidebar::update_after_colormix_change()
+{
+    Model &model = m_plater->model();
+    renumber_virtual_extruders(*m_plater, static_cast<unsigned int>(m_combos_filament.size()));
+    for (size_t obj_idx = 0; obj_idx < model.objects.size(); ++obj_idx)
+        m_object_list->update_info_items(obj_idx);
+    m_plater->schedule_background_process();
+    update_objects_list_extruder_column(m_combos_filament.size());
+    m_object_list->Refresh();
+    if (GLCanvas3D *canvas = m_plater->canvas3D(); canvas != nullptr)
+        canvas->reload_scene(true);
+}
+
 Sidebar::Sidebar(Plater *parent)
     : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(42 * wxGetApp().em_unit(), -1)), m_plater(parent)
 {
@@ -550,9 +582,17 @@ Sidebar::Sidebar(Plater *parent)
 #ifdef _WIN32
     wxGetApp().UpdateDarkUI(m_btn_full_spectrum, true);
 #endif
+    m_btn_colormix = new wxButton(m_presets_panel, wxID_ANY, _L("ColorMax Engine"), wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+    m_btn_colormix->SetToolTip(_L("Print the model's colors as mixes of the spools loaded in your printer (and calibrate how your spools mix)."));
+    m_btn_colormix->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { this->open_colormix_dialog(); });
+#ifdef _WIN32
+    wxGetApp().UpdateDarkUI(m_btn_colormix, true);
+#endif
     {
         auto *btn_row_sizer = new wxBoxSizer(wxHORIZONTAL);
         btn_row_sizer->Add(m_btn_full_spectrum, 1, wxEXPAND);
+        btn_row_sizer->AddSpacer(2);
+        btn_row_sizer->Add(m_btn_colormix, 1, wxEXPAND);
         const int gear_col_width = m_combos_filament[0]->edit_btn->GetBestSize().GetWidth()
                                  + 2 * int(0.3 * wxGetApp().em_unit());
         btn_row_sizer->AddSpacer(gear_col_width);
@@ -1080,6 +1120,8 @@ void Sidebar::sys_color_changed()
         wxGetApp().UpdateAllStaticTextDarkUI(win);
     for (wxWindow* btn : std::vector<wxWindow*>{ m_btn_reslice, m_btn_export_gcode, m_btn_connect_gcode })
         wxGetApp().UpdateDarkUI(btn, true);
+    if (m_btn_colormix)
+        wxGetApp().UpdateDarkUI(m_btn_colormix, true);
     if (m_btn_full_spectrum) {
         wxGetApp().UpdateDarkUI(m_btn_full_spectrum, true);
     }

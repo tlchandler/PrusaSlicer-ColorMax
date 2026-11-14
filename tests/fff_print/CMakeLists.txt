@@ -8,6 +8,7 @@ add_executable(${_TEST_NAME}_tests
 	test_custom_gcode.cpp
 	test_data.cpp
 	test_data.hpp
+	test_colormix_slice.cpp
 	test_extrusion_entity.cpp
 	test_fill.cpp
 	test_flow.cpp

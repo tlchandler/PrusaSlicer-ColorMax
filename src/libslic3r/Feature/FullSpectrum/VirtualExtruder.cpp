@@ -251,6 +251,10 @@ std::vector<unsigned int> VirtualExtruder::build_sequence() const
         return {stops.front().extruder_id, stops.back().extruder_id};
     }
 
+    if (!this->sequence.empty()) {
+        return this->sequence;
+    }
+
     VirtualExtruderComponents active;
     active.reserve(components.size());
     for (const VirtualExtruderComponent& component : components) {
@@ -521,14 +525,17 @@ std::vector<VirtualExtruder> normalize_virtual_extruders(
             continue;
         }
 
-        if (normalized_virtual_extruder.components.size() > MAX_BLEND_COMPONENTS) {
+        // An explicit layer word (ColorMix) defines the mix itself; a dual-wall word pair can use
+        // more filaments than a ratio blend (outer word + inner word).
+        const size_t max_components = raw_virtual_extruder.sequence.empty() ? MAX_BLEND_COMPONENTS : MAX_SEQUENCE_COMPONENTS;
+        if (normalized_virtual_extruder.components.size() > max_components) {
             BOOST_LOG_TRIVIAL(error)
                 << "VirtualExtruder id="
                 << raw_virtual_extruder.id
                 << " dropped: blend recipe has "
                 << normalized_virtual_extruder.components.size()
                 << " components (max "
-                << MAX_BLEND_COMPONENTS
+                << max_components
                 << ")";
             continue;
         }
@@ -536,6 +543,45 @@ std::vector<VirtualExtruder> normalize_virtual_extruders(
         if (std::abs(ratio_sum - 1.0) > 1e-6 && ratio_sum > 0) {
             for (VirtualExtruderComponent& component : normalized_virtual_extruder.components) {
                 component.ratio /= ratio_sum;
+            }
+        }
+
+        if (!raw_virtual_extruder.sequence.empty()) {
+            // Keep an explicit layer word only if it uses exactly the components, in their ratios.
+            // With dual walls, the ratios are the average of the outer and the inner word.
+            const bool dual = !raw_virtual_extruder.inner_sequence.empty();
+            std::map<unsigned int, double> counts;
+            for (unsigned int extruder_id : raw_virtual_extruder.sequence) {
+                counts[extruder_id] += dual ? 0.5 / double(raw_virtual_extruder.sequence.size()) : 1. / double(raw_virtual_extruder.sequence.size());
+            }
+            for (unsigned int extruder_id : raw_virtual_extruder.inner_sequence) {
+                counts[extruder_id] += 0.5 / double(raw_virtual_extruder.inner_sequence.size());
+            }
+
+            bool consistent = true;
+            for (const VirtualExtruderComponent& component : normalized_virtual_extruder.components) {
+                const auto it = counts.find(component.extruder_id);
+                const double share = it == counts.end() ? 0. : it->second;
+                if (component.ratio > 0. && std::abs(share - component.ratio) > 0.02) {
+                    consistent = false;
+                }
+            }
+
+            for (const auto& [extruder_id, count] : counts) {
+                if (std::none_of(normalized_virtual_extruder.components.begin(), normalized_virtual_extruder.components.end(),
+                        [id = extruder_id](const VirtualExtruderComponent& c) { return c.extruder_id == id && c.ratio > 0.; })) {
+                    consistent = false;
+                }
+            }
+
+            if (consistent && raw_virtual_extruder.sequence.size() <= 64 && raw_virtual_extruder.inner_sequence.size() <= 64) {
+                normalized_virtual_extruder.sequence       = raw_virtual_extruder.sequence;
+                normalized_virtual_extruder.inner_sequence = raw_virtual_extruder.inner_sequence;
+            } else {
+                BOOST_LOG_TRIVIAL(warning)
+                    << "VirtualExtruder id="
+                    << raw_virtual_extruder.id
+                    << " explicit layer sequence does not match its components, using ratios instead";
             }
         }
 
@@ -824,6 +870,12 @@ std::string serialize_virtual_extruders_to_json(
             }
 
             entry["components"] = components_array;
+            if (!virtual_extruder.sequence.empty()) {
+                entry["sequence"] = virtual_extruder.sequence;
+            }
+            if (!virtual_extruder.inner_sequence.empty()) {
+                entry["inner_sequence"] = virtual_extruder.inner_sequence;
+            }
         }
 
         virtual_extruders_array.push_back(entry);
@@ -1060,6 +1112,28 @@ FullSpectrumConfig deserialize_virtual_extruders_from_json(
                 << id
                 << " has no valid components, skipping";
             continue;
+        }
+
+        if (entry.contains("sequence") && entry["sequence"].is_array()) {
+            for (const nlohmann::json& extruder : entry["sequence"]) {
+                const int extruder_id = extruder.is_number_integer() ? extruder.get<int>() : -1;
+                if (extruder_id < 1 || extruder_id > static_cast<int>(max_extruder_id)) {
+                    virtual_extruder.sequence.clear();
+                    break;
+                }
+                virtual_extruder.sequence.push_back(static_cast<unsigned int>(extruder_id));
+            }
+        }
+
+        if (!virtual_extruder.sequence.empty() && entry.contains("inner_sequence") && entry["inner_sequence"].is_array()) {
+            for (const nlohmann::json& extruder : entry["inner_sequence"]) {
+                const int extruder_id = extruder.is_number_integer() ? extruder.get<int>() : -1;
+                if (extruder_id < 1 || extruder_id > static_cast<int>(max_extruder_id)) {
+                    virtual_extruder.inner_sequence.clear();
+                    break;
+                }
+                virtual_extruder.inner_sequence.push_back(static_cast<unsigned int>(extruder_id));
+            }
         }
 
         result.virtual_extruders.push_back(std::move(virtual_extruder));

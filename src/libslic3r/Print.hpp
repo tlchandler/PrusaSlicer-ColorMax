@@ -38,6 +38,7 @@
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "MultiMaterialSegmentation.hpp"
 #include "Feature/FullSpectrum/VirtualExtruder.hpp"
+#include "Feature/ColorMix/ModelData.hpp"
 
 #include "libslic3r.h"
 
@@ -685,6 +686,9 @@ public:
         return m_virtual_extruders;
     }
 
+    // ColorMax engine slicing techniques (white core, top patches, layer schedule).
+    const ColorMix::SliceSettings& colormix_slice_settings() const { return m_colormix_slice; }
+
     std::vector<unsigned int> object_extruders() const;
     std::vector<unsigned int> support_material_extruders() const;
     std::vector<unsigned int> extruders() const;
@@ -773,6 +777,7 @@ private:
     PrintObjectPtrs                         m_objects;
     PrintRegionPtrs                         m_print_regions;
     FullSpectrum::VirtualExtruders          m_virtual_extruders;
+    ColorMix::SliceSettings                 m_colormix_slice;
 
     // Ordered collections of extrusion paths to build skirt loops and brim.
     ExtrusionEntityCollection               m_skirt;

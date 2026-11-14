@@ -4,6 +4,8 @@
 set(SLIC3R_APP_NAME "PrusaSlicer")
 set(SLIC3R_APP_KEY "PrusaSlicer")
 set(SLIC3R_VERSION "2.9.7")
-set(SLIC3R_BUILD_ID "PrusaSlicer-${SLIC3R_VERSION}+UNKNOWN")
+# ColorMax version: bump it (and add a section to COLORMAX_CHANGELOG.md) with every release.
+set(COLORMAX_VERSION "0.3.1")
+set(SLIC3R_BUILD_ID "PrusaSlicer-${SLIC3R_VERSION}+ColorMax-${COLORMAX_VERSION}")
 set(SLIC3R_RC_VERSION "2,9,7,0")
 set(SLIC3R_RC_VERSION_DOTS "2.9.7.0")

@@ -95,6 +95,7 @@ class Sidebar : public wxPanel
 	ScalableButton* m_btn_export_all_gcode_removable{ nullptr };
 
     wxButton*                           m_btn_full_spectrum { nullptr };
+    wxButton*                           m_btn_colormix { nullptr };
     std::unique_ptr<FreqChangedParams>  m_frequently_changed_parameters;
     std::unique_ptr<ObjectManipulation> m_object_manipulation;
     std::unique_ptr<ObjectSettings>     m_object_settings;
@@ -115,6 +116,10 @@ class Sidebar : public wxPanel
     void on_select_preset(wxCommandEvent& evt);
 
 public:
+    // ColorMax engine: convert model colors to layer-mixed recipes.
+    void open_colormix_dialog();
+    // Object list, extruder column and 3D scene after ColorMix changed the model and its virtual extruders.
+    void update_after_colormix_change();
     Sidebar(Plater *parent);
     Sidebar(Sidebar &&) = delete;
     Sidebar(const Sidebar &) = delete;

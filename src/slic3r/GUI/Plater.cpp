@@ -18,12 +18,15 @@
 ///|/ PrusaSlicer is released under the terms of the AGPLv3 or higher
 ///|/
 #include "Plater.hpp"
+#include "ColorMixDialog.hpp"
 #include "slic3r/GUI/BitmapCache.hpp"
 #include "slic3r/GUI/Jobs/UIThreadWorker.hpp"
 #include "slic3r/Utils/PrusaConnect.hpp"
 
 #include <cstddef>
 #include <algorithm>
+#include <map>
+#include <set>
 #include <nanosvgrast.h>
 #include <numeric>
 #include <vector>
@@ -70,6 +73,9 @@
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Feature/FullSpectrum/VirtualExtruder.hpp"
+#include "libslic3r/Feature/ColorMix/ColorSpace.hpp"
+#include "libslic3r/Feature/ColorMix/ModelConvert.hpp"
+#include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/SLA/SupportPoint.hpp"
 #include "libslic3r/SLA/ReprojectPointsOnMesh.hpp"
 #include "libslic3r/Print.hpp"
@@ -1542,13 +1548,36 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             this->model.get_custom_gcode_per_print_z_vector() = model.get_custom_gcode_per_print_z_vector();
             this->model.get_wipe_tower_vector()               = model.get_wipe_tower_vector();
             this->model.get_virtual_extruders()               = model.get_virtual_extruders();
+            // ColorMix data describes the objects' painting: only a project load (objects included)
+            // brings it; importing just the config keeps the plater's.
+            if (load_model) {
+                this->model.colormix = model.colormix;
+                if (!model.colormix.unreadable_json.empty())
+                    notification_manager->push_notification(NotificationType::CustomNotification,
+                        NotificationManager::NotificationLevel::WarningNotificationLevel,
+                        _u8L("This project's ColorMax data could not be read (made by a newer version?). Its layer schedule, white "
+                             "core and colors are not applied. It is saved back unchanged unless you use ColorMax in this project "
+                             "(a conversion or a colored import replaces it)."));
+            }
 
-            FullSpectrum::remap_full_spectrum_on_import(
-                model,
-                this->model.get_virtual_extruders(),
-                static_cast<unsigned int>(nozzle_dmrs->values.size()),
-                fs_config
-            );
+            {
+                // Blend ids may move to another tool count: ColorMix's record of the last conversion follows.
+                std::vector<unsigned int> ids_before;
+                for (const FullSpectrum::VirtualExtruder &ve : this->model.get_virtual_extruders())
+                    ids_before.push_back(ve.id);
+                FullSpectrum::remap_full_spectrum_on_import(
+                    model,
+                    this->model.get_virtual_extruders(),
+                    static_cast<unsigned int>(nozzle_dmrs->values.size()),
+                    fs_config
+                );
+                std::map<unsigned int, unsigned int> id_remap;
+                for (size_t i = 0; i < ids_before.size() && i < this->model.get_virtual_extruders().size(); ++i)
+                    if (ids_before[i] != this->model.get_virtual_extruders()[i].id)
+                        id_remap[ids_before[i]] = this->model.get_virtual_extruders()[i].id;
+                if (load_model)
+                    ColorMix::remap_conversion_record(this->model.colormix, id_remap, static_cast<unsigned int>(nozzle_dmrs->values.size()));
+            }
 
             if (!fs_config.physical_colors.empty() && !this->model.virtual_extruders.empty()) {
                 apply_full_spectrum_physical_colors(fs_config.physical_colors, q, this->sidebar);
@@ -1626,8 +1655,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         if (dlg.IsCheckBoxChecked())
                             answer_consider_as_multi_part_objects = answer;
                     }
-                    if (/*!type_printRequest && */answer == wxID_YES) //! type_printRequest is no need here, SLA allow multipart object now
+                    if (/*!type_printRequest && */answer == wxID_YES) { //! type_printRequest is no need here, SLA allow multipart object now
+                        // ColorMix: imported color slots go from the objects to the parts made of them.
+                        const std::vector<unsigned int> colormix_part_slots = ColorMix::multipart_pending_slots(model);
                         ModelProcessing::convert_to_multipart_object(model, nozzle_dmrs->size());
+                        ColorMix::set_multipart_pending_slots(model, colormix_part_slots);
+                    }
                 }
             }
 
@@ -1707,10 +1740,88 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             if (one_by_one) {
                 if ((type_3mf && !is_project_file) || type_any_amf)
                     model.center_instances_around_point(this->bed.build_volume().bed_center());
+                // A colored model from another application: keep its colors and offer the ColorMix conversion.
+                const bool colormix_colored = !is_project_file && !model.colormix.source_colors.empty();
+                size_t     colormix_colors  = 0;
+                bool       colormix_merged  = true;
+                if (colormix_colored) {
+                    // The importer only recorded each object's (or part's) color slot. The objects load as
+                    // in stock PrusaSlicer; the slots become tool assignments when the ColorMix dialog is
+                    // opened. For the palette merge, the slots act as the extruders for a moment.
+                    std::vector<std::pair<ModelConfigObject *, std::optional<int>>> restore;
+                    auto set_slot = [&restore](ModelConfigObject &config, size_t id, const std::map<size_t, unsigned int> &pending) {
+                        if (auto it = pending.find(id); it != pending.end() && it->second > 0) {
+                            restore.emplace_back(&config, config.has("extruder") ? std::optional<int>(config.extruder()) : std::nullopt);
+                            config.set("extruder", int(it->second));
+                        }
+                    };
+                    for (ModelObject *o : model.objects) {
+                        set_slot(o->config, o->id().id, model.colormix.pending_import_slots);
+                        for (ModelVolume *v : o->volumes)
+                            set_slot(v->config, v->id().id, model.colormix.pending_import_slots);
+                    }
+                    colormix_colors = ColorMix::imported_color_count(model);
+                    const FullSpectrum::VirtualExtruders blends_before = this->model.virtual_extruders;
+                    colormix_merged = ColorMix::merge_imported_palette(this->model, model, q->get_extruder_color_strings_from_plater_config());
+                    if (this->model.virtual_extruders != blends_before)
+                        sidebar->update_after_colormix_change(); // leftover ColorMix blends went
+                    if (colormix_merged)
+                        this->model.colormix.unreadable_json.clear(); // replaced by this import's data
+                    for (auto &[config, extruder] : restore)
+                        if (extruder)
+                            config->set("extruder", *extruder);
+                        else
+                            config->erase("extruder");
+                }
+                // The pending slots go with the objects: those of a project replace the copied ones
+                // (kept by the ids of the loaded file's objects).
+                if (is_project_file)
+                    this->model.colormix.pending_import_slots.clear();
+                // load_model_objects() sorts the parts of each copy: sorted here the same way, the
+                // parts keep their positions.
+                if (!model.colormix.pending_import_slots.empty())
+                    for (ModelObject *o : model.objects)
+                        o->sort_volumes(get_config_bool("order_volumes"));
                 auto loaded_idxs = load_model_objects(model.objects, is_project_file);
                 obj_idxs.insert(obj_idxs.end(), loaded_idxs.begin(), loaded_idxs.end());
+                ColorMix::copy_pending_slots(model, this->model, loaded_idxs);
+                if (colormix_colored) {
+                    if (!colormix_merged)
+                        notification_manager->push_notification(NotificationType::CustomNotification,
+                            NotificationManager::NotificationLevel::WarningNotificationLevel,
+                            format(_L("%1%: together with the models already on the plater there are too many colors (more than 255). "
+                                      "Its colors may show as those of the other models."), from_path(filename)));
+                    if (wxGetApp().extruders_edited_cnt() > 1) {
+                        notification_manager->push_notification(NotificationType::CustomNotification,
+                            NotificationManager::NotificationLevel::RegularNotificationLevel,
+                            format(_L("%1% has %2% colors."), from_path(filename), colormix_colors),
+                            into_u8(_L("Convert them to ColorMax layer blends")),
+                            [this](wxEvtHandler *) { this->sidebar->open_colormix_dialog(); return true; });
+                        // A corner notification is easy to miss (and opening a file as a project can drop it):
+                        // ask once the file is loaded. "Don't ask again" leaves only the notification.
+                        if (wxGetApp().app_config->get("colormix_ask_on_import") != "0") {
+                            const wxString name   = from_path(filename);
+                            const size_t   ncolor = colormix_colors;
+                            q->CallAfter([this, name, ncolor]() {
+                                RichMessageDialog dlg(q,
+                                    format_wxstr(_L("%1% has %2% colors.\n\nPrint them as mixes of the spools loaded in your printer? "
+                                                    "ColorMax shows how every color will print before anything is changed."),
+                                                 name, ncolor),
+                                    _L("ColorMax Engine"), wxYES_NO | wxICON_QUESTION);
+                                dlg.SetYesNoLabels(_L("Open ColorMax"), _L("Not now"));
+                                dlg.ShowCheckBox(_L("Don't ask again (the notification stays)"));
+                                const int rc = dlg.ShowModal();
+                                if (dlg.IsCheckBoxChecked())
+                                    wxGetApp().app_config->set("colormix_ask_on_import", "0");
+                                if (rc == wxID_YES)
+                                    this->sidebar->open_colormix_dialog();
+                            });
+                        }
+                    }
+                }
             } else {
                 // This must be an .stl or .obj file, which may contain a maximum of one volume.
+                // (Any 3MF makes the load one by one: only a 3MF brings ColorMix colors.)
                 for (const ModelObject* model_object : model.objects) {
                     extra_model->add_object(*model_object);
                 }
@@ -2153,6 +2264,15 @@ void Plater::priv::delete_all_objects_from_model()
     // Stop and reset the Print content.
     background_process.reset();
     model.clear_objects();
+    // The ColorMix palette, schedule and core described the deleted objects, and so did its blends
+    // (layer words); Full Spectrum's own virtual extruders stay, as in stock. Data this build couldn't
+    // read stays with the project (it is written back unchanged), and so does the record of the
+    // printer's colors from before ColorMix changed them.
+    // The project's own (Full Spectrum) blends that a conversion replaced come back.
+    model.virtual_extruders = ColorMix::blends_after_delete_all(model);
+    model.colormix          = ColorMix::data_after_delete_all(model.colormix);
+    // The remaining blends get consecutive ids again (the extruder combos list them so).
+    sidebar->update_after_colormix_change();
     update();
     // Delete object from Sidebar list. Do it after update, so that the GLScene selection is updated with the modified model.
     sidebar->obj_list()->delete_all_objects_from_list();
@@ -2184,10 +2304,19 @@ void Plater::priv::reset()
     // Stop and reset the Print content.
     this->background_process.reset();
     model.clear_objects();
+    // The ColorMix settings and the virtual extruders belong to the project: the next one starts without them.
+    const bool had_virtual_extruders = !model.virtual_extruders.empty();
+    model.colormix = ColorMix::ModelData();
+    // ColorMix's blends (layer words) go with it; Full Spectrum's own stay, as in stock.
+    model.virtual_extruders.erase(std::remove_if(model.virtual_extruders.begin(), model.virtual_extruders.end(),
+                                                 [](const FullSpectrum::VirtualExtruder &ve) { return !ve.sequence.empty(); }),
+                                  model.virtual_extruders.end());
     update();
     // Delete object from Sidebar list. Do it after update, so that the GLScene selection is updated with the modified model.
     sidebar->obj_list()->delete_all_objects_from_list();
     object_list_changed();
+    if (had_virtual_extruders)
+        sidebar->update_after_colormix_change();
 
     // The hiding of the slicing results, if shown, is not taken care by the background process, so we do it here
     this->sidebar->show_sliced_info_sizer(false);
@@ -2832,6 +2961,7 @@ bool Plater::priv::replace_volume_with_stl(int object_idx, int volume_idx, const
         new_volume->supported_facets.assign(old_volume->supported_facets);
         new_volume->seam_facets.assign(old_volume->seam_facets);
         new_volume->mm_segmentation_facets.assign(old_volume->mm_segmentation_facets);
+        new_volume->colormix_source_facets.assign(old_volume->colormix_source_facets);
         new_volume->fuzzy_skin_facets.assign(old_volume->fuzzy_skin_facets);
     }
     std::swap(old_model_object->volumes[volume_idx], old_model_object->volumes.back());
@@ -4370,6 +4500,9 @@ void Plater::priv::undo_redo_to(std::vector<UndoRedo::Snapshot>::const_iterator 
 
     // Make a copy of the snapshot, undo/redo could invalidate the iterator
     const UndoRedo::Snapshot snapshot_copy = *it_snapshot;
+    // Undo/redo restores the virtual extruders too (ColorMix conversions): the sidebar lists them.
+    const FullSpectrum::VirtualExtruders virtual_extruders_before = model.virtual_extruders;
+    const std::string                    colormix_options_before  = model.colormix.options_json;
     // Do the jump in time.
     if (it_snapshot->timestamp < this->undo_redo_stack().active_snapshot_time() ?
         this->undo_redo_stack().undo(model, this->view3D->get_canvas3d()->get_selection(), this->view3D->get_canvas3d()->get_gizmos_manager(), top_snapshot_data, it_snapshot->timestamp) :
@@ -4397,6 +4530,12 @@ void Plater::priv::undo_redo_to(std::vector<UndoRedo::Snapshot>::const_iterator 
             this->sidebar->obj_list()->set_selected_layers_range_idx(layer_range_idx);
 
         this->update_after_undo_redo(snapshot_copy, temp_snapshot_was_taken);
+        colormix_sync_extruder_colors_after_undo(q, colormix_options_before, model.colormix.options_json);
+        if (model.virtual_extruders != virtual_extruders_before) {
+            sidebar->update_objects_list_extruder_column(size_t(std::max(1, wxGetApp().extruders_edited_cnt())));
+            for (size_t obj_idx = 0; obj_idx < model.objects.size(); ++obj_idx)
+                sidebar->obj_list()->update_info_items(obj_idx);
+        }
         // Enable layer editing after the Undo / Redo jump.
         if (! view3D->is_layers_editing_enabled() && this->layers_height_allowed() && new_variable_layer_editing_active)
             view3D->get_canvas3d()->force_main_toolbar_left_action(view3D->get_canvas3d()->get_main_toolbar_item_id("layersediting"));
@@ -5784,6 +5923,11 @@ void Plater::toggle_layers_editing(bool enable)
 {
     if (canvas3D()->is_layers_editing_enabled() != enable)
         canvas3D()->force_main_toolbar_left_action(canvas3D()->get_main_toolbar_item_id("layersediting"));
+}
+
+std::vector<size_t> Plater::add_model_objects(const ModelObjectPtrs& objects)
+{
+    return p->load_model_objects(objects);
 }
 
 void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs& new_objects)
@@ -7413,6 +7557,7 @@ void Plater::clear_before_change_volume(ModelVolume &mv, const std::string &noti
         mv.supported_facets.reset();
         mv.seam_facets.reset();
         mv.mm_segmentation_facets.reset();
+        mv.colormix_source_facets.reset();
         mv.fuzzy_skin_facets.reset();
 
         get_notification_manager()->push_notification(
@@ -7434,6 +7579,7 @@ void Plater::clear_before_change_mesh(int obj_idx, const std::string &notificati
         mv->supported_facets.reset();
         mv->seam_facets.reset();
         mv->mm_segmentation_facets.reset();
+        mv->colormix_source_facets.reset();
         mv->fuzzy_skin_facets.reset();
     }
     if (paint_removed) {

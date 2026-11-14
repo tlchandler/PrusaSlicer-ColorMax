@@ -453,6 +453,15 @@ bool Print::has_brim() const
 boost::regex regex_g92e0 { "^[ \\t]*[gG]92[ \\t]*[eE](0(\\.0*)?|\\.0+)[ \\t]*(;.*)?$" };
 
 // Precondition: Print::validate() requires the Print::apply() to be called its invocation.
+// An object's own layer heights: variable layer height, or a height range setting the layer height
+// (ranges changing only other settings don't count).
+static bool changes_layer_heights(const ModelObject &object)
+{
+    return ! object.layer_height_profile.empty() ||
+           std::any_of(object.layer_config_ranges.begin(), object.layer_config_ranges.end(),
+                       [](const auto &range) { return range.second.has("layer_height"); });
+}
+
 std::string Print::validate(std::vector<std::string>* warnings) const
 {
     std::vector<unsigned int> extruders = this->extruders();
@@ -545,15 +554,98 @@ std::string Print::validate(std::vector<std::string>* warnings) const
         [](const PrintObject *object) { return object->model_object()->has_custom_layering(); }) 
         != m_objects.end();
 
+    // A ColorMix layer schedule replaces every object's variable layer height and height ranges.
+    if (! m_colormix_slice.layer_schedule.empty())
+        has_custom_layering = false;
+
     // Custom layering is not allowed for tree supports as of now.
     for (size_t print_object_idx = 0; print_object_idx < m_objects.size(); ++ print_object_idx)
         if (const PrintObject &print_object = *m_objects[print_object_idx];
             print_object.has_support_material() && print_object.config().support_material_style.value == smsOrganic &&
+            m_colormix_slice.layer_schedule.empty() && // a schedule replaces the profile (checked below)
             print_object.model_object()->has_custom_layering()) {
             if (const std::vector<coordf_t> &layers = layer_height_profile(print_object_idx); ! layers.empty())
                 if (! check_object_layers_fixed(print_object.slicing_parameters(), layers))
                     return _u8L("Variable layer height is not supported with Organic supports.");
         }
+
+    // ColorMix techniques work on painted regions. A ColorMix blend set as a whole part's extruder
+    // prints its outer layer word only (no inner wall, white core or top patches).
+    if (warnings != nullptr && ! m_virtual_extruders.empty()) {
+        const unsigned int num_physical = unsigned(m_config.nozzle_diameter.size());
+        for (const PrintObject *object : m_objects)
+            for (const ModelVolume *volume : object->model_object()->volumes) {
+                const int e = volume->extruder_id();
+                if (! volume->is_model_part() || e <= int(num_physical))
+                    continue;
+                const auto ve = std::find_if(m_virtual_extruders.begin(), m_virtual_extruders.end(),
+                                             [e](const FullSpectrum::VirtualExtruder &v) { return int(v.id) == e; });
+                if (ve != m_virtual_extruders.end() && ! ve->sequence.empty() &&
+                    (! ve->inner_sequence.empty() || m_colormix_slice.core_extruder > 0 || m_colormix_slice.top_pattern)) {
+                    warnings->emplace_back(format(_u8L("\"%1%\" uses the layer blend %2% as its extruder: only painted regions get "
+                                                       "dual walls, the white core and top patches. Paint the part instead."),
+                                                  volume->name.empty() ? object->model_object()->name : volume->name, e));
+                    break;
+                }
+            }
+    }
+
+    // ColorMix layer words are predicted for uniform (or scheduled) layer heights: an object's own
+    // variable layer height / height ranges change how much of each filament shows.
+    if (warnings != nullptr && m_colormix_slice.layer_schedule.empty() &&
+        std::any_of(m_virtual_extruders.begin(), m_virtual_extruders.end(), [](const FullSpectrum::VirtualExtruder &v) { return ! v.sequence.empty(); }))
+        for (const PrintObject *object : m_objects)
+            if (object->model_object()->is_mm_painted() && changes_layer_heights(*object->model_object()))
+                warnings->emplace_back(format(_u8L("\"%1%\" has variable layer height or height ranges: its ColorMax layer blends will print "
+                                                   "other colors than predicted. Remove them, or set a ColorMax layer schedule."),
+                                              object->model_object()->name));
+
+    // ColorMix settings the current printer can't do (e.g. a project made for more tools).
+    if (warnings != nullptr) {
+        const unsigned int num_physical = unsigned(m_config.nozzle_diameter.size());
+        if (m_colormix_slice.core_extruder > num_physical)
+            warnings->emplace_back(format(_u8L("The ColorMax white core uses tool %1%, but the printer has %2% tools: there is no white core."),
+                                          m_colormix_slice.core_extruder, num_physical));
+        for (const FullSpectrum::VirtualExtruder &ve : m_virtual_extruders) {
+            bool missing = false;
+            for (unsigned int t : ve.sequence)
+                missing |= t > num_physical;
+            for (unsigned int t : ve.inner_sequence)
+                missing |= t > num_physical;
+            if (missing) {
+                warnings->emplace_back(format(_u8L("ColorMax layer blends use tools the printer doesn't have (%1% tools): those colors print "
+                                                   "with the parts' own extruders. Convert again for this printer."), num_physical));
+                break;
+            }
+        }
+    }
+
+    // ColorMix layer schedule: same limits as variable layer height.
+    if (const std::vector<double> &schedule = m_colormix_slice.layer_schedule; ! schedule.empty() && ! m_objects.empty()) {
+        if (schedule.size() > SlicingParameters::MAX_LAYER_SCHEDULE)
+            return format(_u8L("The ColorMax layer schedule has %1% heights; at most %2% are supported."), schedule.size(),
+                          SlicingParameters::MAX_LAYER_SCHEDULE);
+        const bool varies = std::any_of(schedule.begin(), schedule.end(), [&schedule](double h) { return std::abs(h - schedule.front()) > EPSILON; });
+        for (const PrintObject *object : m_objects) {
+            if (varies && object->has_support_material() && object->config().support_material_style.value == smsOrganic)
+                return _u8L("Variable layer height (ColorMax layer schedule) is not supported with Organic supports.");
+            if (warnings != nullptr && changes_layer_heights(*object->model_object()))
+                warnings->emplace_back(format(_u8L("The ColorMax layer schedule replaces the variable layer height and height ranges of \"%1%\"."),
+                                              object->model_object()->name));
+        }
+        for (unsigned int e : this->extruders()) {
+            if (e >= m_config.nozzle_diameter.size())
+                continue;
+            const double min_h = m_config.min_layer_height.get_at(e);
+            double       max_h = m_config.max_layer_height.get_at(e);
+            if (max_h <= 0.)
+                max_h = 0.75 * m_config.nozzle_diameter.get_at(e);
+            for (double h : schedule)
+                if (h < min_h - EPSILON || h > max_h + EPSILON)
+                    return format(_u8L("The ColorMax layer schedule height %1% mm is outside the printer's layer height limits (%2% - %3% mm)."),
+                                  h, min_h, max_h);
+        }
+    }
 
     if (this->has_wipe_tower() && ! m_objects.empty()) {
         // Make sure all extruders use same diameter filament and have the same nozzle diameter
@@ -593,7 +685,9 @@ std::string Print::validate(std::vector<std::string>* warnings) const
                 const PrintObject       *object         = m_objects[i];
                 const SlicingParameters &slicing_params = object->slicing_parameters();
                 if (std::abs(slicing_params.first_print_layer_height - slicing_params0.first_print_layer_height) > EPSILON ||
-                    std::abs(slicing_params.layer_height             - slicing_params0.layer_height            ) > EPSILON)
+                    // A ColorMix layer schedule gives every object the same layers.
+                    (m_colormix_slice.layer_schedule.empty() &&
+                     std::abs(slicing_params.layer_height - slicing_params0.layer_height) > EPSILON))
                     return _u8L("The Wipe Tower is only supported for multiple objects if they have equal layer heights");
                 if (slicing_params.raft_layers() != slicing_params0.raft_layers())
                     return _u8L("The Wipe Tower is only supported for multiple objects if they are printed over an equal number of raft layers");
@@ -993,7 +1087,7 @@ void Print::process()
 
     m_conflict_result = conflictRes;
     if (conflictRes.has_value())
-        BOOST_LOG_TRIVIAL(error) << boost::format("gcode path conflicts found between %1% and %2%") % conflictRes->_objName1 % conflictRes->_objName2;
+        BOOST_LOG_TRIVIAL(error) << boost::format("gcode path conflicts found between %1% and %2% at height %3%") % conflictRes->_objName1 % conflictRes->_objName2 % conflictRes->_height;
 
     m_sequential_collision_detected =  config().complete_objects ? check_seq_conflict(model(), config()) : std::nullopt;
 
@@ -1023,7 +1117,7 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
     std::unique_ptr<GCodeGenerator> gcode(new GCodeGenerator(const_cast<const Print*>(this)));
     gcode->do_export(this, path.c_str(), result, thumbnail_cb);
 
-    if (m_conflict_result.has_value())
+    if (result != nullptr && m_conflict_result.has_value())
         result->conflict_result = *m_conflict_result;
 
     if (result)

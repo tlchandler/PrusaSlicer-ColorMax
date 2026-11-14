@@ -17,6 +17,7 @@
 #include <cassert>
 #include <cstddef>
 
+#include "libslic3r/Feature/ColorMix/ModelConvert.hpp"
 #include "Model.hpp"
 #include "Print.hpp"
 #include "admesh/stl.h"
@@ -114,6 +115,8 @@ static inline void model_volume_list_copy_configs(ModelObject &model_object_dst,
         mv_dst.mm_segmentation_facets.assign(mv_src.mm_segmentation_facets);
         assert(mv_dst.fuzzy_skin_facets.id() == mv_src.fuzzy_skin_facets.id());
         mv_dst.fuzzy_skin_facets.assign(mv_src.fuzzy_skin_facets);
+        assert(mv_dst.colormix_source_facets.id() == mv_src.colormix_source_facets.id());
+        mv_dst.colormix_source_facets.assign(mv_src.colormix_source_facets);
         //FIXME what to do with the materials?
         // mv_dst.m_material_id = mv_src.m_material_id;
         ++ i_src;
@@ -1213,15 +1216,27 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     // Apply variables to placeholder parser. The placeholder parser is used by G-code export,
     // which should be stopped if print_diff is not empty.
-    const bool virtual_extruders_differ = (virtual_extruders != m_virtual_extruders);
+    // ColorMax engine settings are applied like virtual extruders: any change re-slices the objects.
+    const bool colormix_schedule_differ = model.colormix.slice.layer_schedule != m_colormix_slice.layer_schedule;
+    const bool colormix_differ          = model.colormix.slice != m_colormix_slice;
+    const bool virtual_extruders_differ = virtual_extruders != m_virtual_extruders;
+    if (colormix_differ || virtual_extruders_differ)
+        // The background slicing reads these: stop it before they change.
+        this->call_cancel_callback();
+    const ColorMix::SliceSettings colormix_before = m_colormix_slice;
+    if (colormix_differ)
+        m_colormix_slice = model.colormix.slice;
 
     const size_t prev_num_extruders = m_config.nozzle_diameter.size();
     m_virtual_extruders             = virtual_extruders;
 
-    if (virtual_extruders_differ) {
+    if (virtual_extruders_differ || colormix_differ) {
         update_apply_status(this->invalidate_step(psWipeTower));
         update_apply_status(this->invalidate_step(psGCodeExport));
     }
+    if (colormix_schedule_differ)
+        for (PrintObject *print_object : m_objects)
+            print_object->m_slicing_params.valid = false;
 
     bool   num_extruders_changed = false;
     if (! full_config_diff.empty()) {
@@ -1398,6 +1413,9 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         // Only volume IDs, volume types, transformation matrices and their order are checked, configuration and other parameters are NOT checked.
         bool solid_or_modifier_differ   = model_volume_list_changed(model_object, model_object_new, solid_or_modifier_types) ||
                                           model_mmu_segmentation_data_changed(model_object, model_object_new) ||
+                                          // ColorMix techniques follow whether it is a ColorMix object (its source painting).
+                                          ColorMix::is_colormix_object(model_object, model.colormix.slice, virtual_extruders) !=
+                                              ColorMix::is_colormix_object(model_object_new, model.colormix.slice, virtual_extruders) ||
                                           (model_object_new.is_mm_painted() && num_extruders_changed) ||
                                           model_fuzzy_skin_data_changed(model_object, model_object_new);
         bool supports_differ            = model_volume_list_changed(model_object, model_object_new, ModelVolumeType::SUPPORT_BLOCKER) ||
@@ -1412,7 +1430,12 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             model_object_status.print_object_regions = print_objects_range.begin()->print_object->m_shared_regions;
             model_object_status.print_object_regions->ref_cnt_inc();
         }
-        if (solid_or_modifier_differ || model_origin_translation_differ || layer_height_ranges_differ || virtual_extruders_differ ||
+        // ColorMix settings other than the layer schedule only change ColorMix objects (with the old or
+        // the new settings).
+        const bool colormix_object_differ = colormix_schedule_differ ||
+            (colormix_differ && (ColorMix::is_colormix_object(model_object_new, model.colormix.slice, virtual_extruders) ||
+                                 ColorMix::is_colormix_object(model_object_new, colormix_before, virtual_extruders)));
+        if (solid_or_modifier_differ || model_origin_translation_differ || layer_height_ranges_differ || virtual_extruders_differ || colormix_object_differ ||
             ! model_object.layer_height_profile.timestamp_matches(model_object_new.layer_height_profile)) {
             // The very first step (the slicing step) is invalidated. One may freely remove all associated PrintObjects.
             model_object_status.print_object_regions_status = 
@@ -1641,6 +1664,13 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             // Expand virtual extruder IDs to their physical components.
             // PaintedRegions will be created only for physical extruder IDs.
             painting_extruders = expand_virtual_extruders_1based(painting_extruders, virtual_extruders);
+            // ColorMix white core: the core extruder needs a painted region too.
+            const bool colormix_object = ColorMix::is_colormix_object(model_object, m_colormix_slice, m_virtual_extruders);
+            if (const unsigned int core = m_colormix_slice.core_extruder;
+                colormix_object && !painting_extruders.empty() && core >= 1 && core <= num_physical_extruders) {
+                painting_extruders.emplace_back(core);
+                sort_remove_duplicates(painting_extruders);
+            }
         }
         if (model_object_status.print_object_regions_status == ModelObjectStatus::PrintObjectRegionsStatus::Valid) {
             // Verify that the trafo for regions & volume bounding boxes thus for regions is still applicable.

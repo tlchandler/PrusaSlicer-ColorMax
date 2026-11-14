@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 #include <cassert>
 #include <cstddef>
 
+#include "libslic3r/Feature/ColorMix/ModelConvert.hpp"
 #include "ClipperUtils.hpp"
 #include "ElephantFootCompensation.hpp"
 #include "I18N.hpp"
@@ -24,6 +26,7 @@
 #include "admesh/stl.h"
 #include "libslic3r/Feature/Interlocking/InterlockingGenerator.hpp"
 #include "libslic3r/Feature/FullSpectrum/VirtualExtruder.hpp"
+#include "libslic3r/Feature/ColorMix/SliceTechniques.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Exception.hpp"
@@ -578,25 +581,211 @@ void PrintObject::slice()
     this->set_done(posSlice);
 }
 
+// ColorMix: when every part of the object is painted in one single color (or not painted), its
+// segmentation is simply the slices of each part. This skips projecting the painted triangles onto
+// the layer contours, which mixes up colors where many parts share flat faces (calibration boards:
+// dozens of cells side by side). Returns nothing if any part has mixed painting or the object has
+// modifiers, so normal painted models use the regular segmentation.
+template<typename ThrowOnCancel>
+static std::optional<std::vector<std::vector<ExPolygons>>> segmentation_from_uniform_parts(const PrintObject &print_object,
+                                                                                          ThrowOnCancel throw_on_cancel)
+{
+    const Print &print = *print_object.print();
+    // Only for ColorMix projects (calibration plates, converted models): stock projects keep the
+    // stock segmentation, including its painted-region width / interlocking settings.
+    const bool colormix = ColorMix::is_colormix_object(*print_object.model_object(), print.colormix_slice_settings(), print.virtual_extruders());
+    const ModelVolumePtrs &volumes = print_object.model_object()->volumes;
+    if (!colormix || volumes.size() < 2 || print_object.config().mmu_segmented_region_interlocking_depth.value > 0.)
+        return std::nullopt;
+    // Whole-part regions ignore "max segmented region width": only for calibration plates / slope
+    // tests (made of full-color cells), or when that width is unlimited.
+    if (print_object.config().mmu_segmented_region_max_width.value > 0. && !print.colormix_slice_settings().whole_part_regions)
+        return std::nullopt;
+    unsigned int max_id = unsigned(print.config().nozzle_diameter.size());
+    const FullSpectrum::VirtualExtruders ves = print.virtual_extruders(); // a copy, see apply_mm_segmentation()
+    for (const FullSpectrum::VirtualExtruder &ve : ves)
+        max_id = std::max(max_id, ve.id);
+
+    struct Part { const ModelVolume *volume; unsigned int state; };
+    std::vector<Part> parts;
+    bool              any_painted = false;
+    for (const ModelVolume *mv : volumes) {
+        if (!mv->is_model_part())
+            return std::nullopt;
+        unsigned int state = 0;
+        if (mv->is_mm_painted()) {
+            // Uniform = every triangle stored as a leaf of one single painted state.
+            const TriangleSelector::TriangleSplittingData &data = mv->mm_segmentation_facets.get_data();
+            if (data.triangles_to_split.size() != mv->mesh().its.indices.size())
+                return std::nullopt;
+            int used = -1;
+            for (size_t st = 0; st < data.used_states.size(); ++st)
+                if (data.used_states[st]) {
+                    if (used >= 0 || st == 0)
+                        return std::nullopt;
+                    used = int(st);
+                }
+            if (used <= 0)
+                return std::nullopt;
+            state       = unsigned(used) <= max_id ? unsigned(used) : 0;
+            any_painted = true;
+        }
+        parts.push_back({mv, state});
+    }
+    if (!any_painted)
+        return std::nullopt;
+
+    MeshSlicingParamsEx params_base;
+    params_base.closing_radius = print_object.config().slice_closing_radius.value;
+    params_base.resolution     = print.config().resolution.value;
+    switch (print_object.config().slicing_mode.value) {
+    case SlicingMode::Regular:    params_base.mode = MeshSlicingParams::SlicingMode::Regular; break;
+    case SlicingMode::EvenOdd:    params_base.mode = MeshSlicingParams::SlicingMode::EvenOdd; break;
+    case SlicingMode::CloseHoles: params_base.mode = MeshSlicingParams::SlicingMode::Positive; break;
+    }
+    params_base.mode_below = params_base.mode;
+
+    const size_t       num_layers = print_object.layer_count();
+    std::vector<float> zs(num_layers);
+    std::vector<ExPolygons> outline(num_layers), taken(num_layers);
+    for (size_t l = 0; l < num_layers; ++l) {
+        const Layer &layer = *print_object.get_layer(int(l));
+        zs[l]              = float(layer.slice_z);
+        Polygons polys;
+        for (const LayerRegion *layerm : layer.regions())
+            polygons_append(polys, to_polygons(layerm->slices().surfaces));
+        outline[l] = union_ex(polys);
+    }
+    std::vector<std::vector<ExPolygons>> segmentation(num_layers, std::vector<ExPolygons>(max_id));
+    // Later parts in the object list win where parts overlap, as stock region slicing clips them.
+    for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+        throw_on_cancel();
+        MeshSlicingParamsEx params = params_base;
+        params.trafo = print_object.trafo_centered() * it->volume->get_matrix();
+        indexed_triangle_set its = it->volume->mesh().its;
+        if (params.trafo.rotation().determinant() < 0.)
+            its_flip_triangles(its); // mirrored part, as in slice_volume()
+        const std::vector<ExPolygons> slices = slice_mesh_ex(its, zs, params, [&throw_on_cancel]() { throw_on_cancel(); });
+        const unsigned int state = it->state;
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+            for (size_t l = range.begin(); l < range.end(); ++l) {
+                if (l >= slices.size() || slices[l].empty() || outline[l].empty())
+                    continue;
+                // Grow a hair so neighbouring parts leave no seam between them.
+                ExPolygons mine = diff_ex(intersection_ex(offset_ex(slices[l], scaled<float>(0.02)), outline[l]), taken[l]);
+                if (mine.empty())
+                    continue;
+                if (state > 0)
+                    append(segmentation[l][state - 1], mine);
+                append(taken[l], std::move(mine));
+                taken[l] = union_ex(taken[l]);
+            }
+        });
+    }
+    for (std::vector<ExPolygons> &layer : segmentation)
+        for (ExPolygons &slot : layer)
+            if (slot.size() > 1)
+                slot = union_ex(slot);
+    return segmentation;
+}
+
 template<typename ThrowOnCancel>
 void apply_mm_segmentation(PrintObject &print_object, ThrowOnCancel throw_on_cancel)
 {
+    if (print_object.layer_count() == 0)
+        return; // PrintObject::slice() reports "No layers were detected"
+    // ColorMix techniques (white core, cleanup, patches, dual walls) belong to converted objects and
+    // calibration plates; an ordinary painted object on the same plate slices as in stock.
+    const bool colormix_object = ColorMix::is_colormix_object(*print_object.model_object(), print_object.print()->colormix_slice_settings(),
+                                                              print_object.print()->virtual_extruders());
     // Returns MM segmentation based on painting in MM segmentation gizmo
-    std::vector<std::vector<ExPolygons>> segmentation = multi_material_segmentation_by_painting(print_object, throw_on_cancel);
+    std::vector<std::vector<ExPolygons>> segmentation;
+    if (std::optional<std::vector<std::vector<ExPolygons>>> uniform = segmentation_from_uniform_parts(print_object, throw_on_cancel))
+        segmentation = std::move(*uniform);
+    else
+        segmentation = multi_material_segmentation_by_painting(print_object, throw_on_cancel);
     assert(segmentation.size() == print_object.layer_count());
 
-    if (!print_object.print()->virtual_extruders().empty()) {
+    // Solid shells (the white core leaves them in the region's color).
+    int top_shells = 0, bottom_shells = 0;
+    {
+        // The thinnest layer above the first (a ColorMix layer schedule may be thinner than the
+        // profile's layer height): enough shell layers for the minimum shell thickness.
+        double h = print_object.config().layer_height.value;
+        for (size_t l = 1; l < print_object.layer_count(); ++l)
+            h = std::min(h, print_object.get_layer(int(l))->height);
+        h = std::max(0.01, h);
+        for (size_t region_id = 0; region_id < print_object.num_printing_regions(); ++region_id) {
+            const PrintRegionConfig &rc = print_object.printing_region(region_id).config();
+            top_shells    = std::max({top_shells, rc.top_solid_layers.value, int(std::ceil(rc.top_solid_min_thickness.value / h - 1e-6))});
+            bottom_shells = std::max({bottom_shells, rc.bottom_solid_layers.value, int(std::ceil(rc.bottom_solid_min_thickness.value / h - 1e-6))});
+        }
+    }
+
+    // Copies: the settings must not change under a running background slice.
+    const FullSpectrum::VirtualExtruders virtual_extruders = print_object.print()->virtual_extruders();
+    if (!virtual_extruders.empty()) {
         std::vector<double> print_z_per_layer(segmentation.size());
         for (size_t layer_id = 0; layer_id < segmentation.size(); ++layer_id) {
             print_z_per_layer[layer_id] = print_object.get_layer(int(layer_id))->print_z;
         }
 
-        FullSpectrum::remap_virtual_extruders_to_physical(
-            segmentation,
-            print_z_per_layer,
-            print_object.print()->num_physical_extruders(),
-            print_object.print()->virtual_extruders()
-        );
+        // A copy: the settings must not change under a running background slice.
+        const ColorMix::SliceSettings colormix = print_object.print()->colormix_slice_settings();
+        const bool any_dual = std::any_of(virtual_extruders.begin(), virtual_extruders.end(),
+                                          [](const FullSpectrum::VirtualExtruder &ve) { return !ve.inner_sequence.empty(); });
+        if (colormix_object && (colormix.top_pattern || colormix.core_extruder > 0 || any_dual || colormix.region_cleanup)) {
+            // Layer outlines: union of all region slices of each layer.
+            std::vector<ExPolygons> outlines(segmentation.size());
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, segmentation.size()), [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t layer_id = range.begin(); layer_id < range.end(); ++layer_id) {
+                    const Layer &layer = *print_object.get_layer(int(layer_id));
+                    Polygons     polys;
+                    for (const LayerRegion *layerm : layer.regions())
+                        polygons_append(polys, to_polygons(layerm->slices().surfaces));
+                    outlines[layer_id] = union_ex(polys);
+                }
+            });
+            ColorMix::apply_slice_techniques(
+                segmentation,
+                outlines,
+                print_z_per_layer,
+                print_object.print()->num_physical_extruders(),
+                virtual_extruders,
+                colormix,
+                [&throw_on_cancel]() { throw_on_cancel(); },
+                top_shells,
+                bottom_shells,
+                print_object.get_layer(0)->height
+            );
+        } else {
+            FullSpectrum::remap_virtual_extruders_to_physical(
+                segmentation,
+                print_z_per_layer,
+                print_object.print()->num_physical_extruders(),
+                virtual_extruders
+            );
+        }
+    } else if (const ColorMix::SliceSettings colormix = print_object.print()->colormix_slice_settings();
+               colormix_object && (colormix.core_extruder > 0 || colormix.region_cleanup)) {
+        // White core and region cleanup without virtual extruders (solid colors only).
+        std::vector<double>     print_z_per_layer(segmentation.size());
+        std::vector<ExPolygons> outlines(segmentation.size());
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, segmentation.size()), [&](const tbb::blocked_range<size_t> &range) {
+            for (size_t layer_id = range.begin(); layer_id < range.end(); ++layer_id) {
+                const Layer &layer = *print_object.get_layer(int(layer_id));
+                print_z_per_layer[layer_id] = layer.print_z;
+                Polygons polys;
+                for (const LayerRegion *layerm : layer.regions())
+                    polygons_append(polys, to_polygons(layerm->slices().surfaces));
+                outlines[layer_id] = union_ex(polys);
+            }
+        });
+        ColorMix::SliceSettings core_only = colormix;
+        core_only.top_pattern = false;
+        ColorMix::apply_slice_techniques(segmentation, outlines, print_z_per_layer, print_object.print()->num_physical_extruders(), {}, core_only,
+                                         [&throw_on_cancel]() { throw_on_cancel(); }, top_shells, bottom_shells,
+                                         print_object.get_layer(0)->height);
     }
 
     tbb::parallel_for(

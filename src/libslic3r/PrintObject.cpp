@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdlib>
 
+#include "libslic3r/Feature/ColorMix/ModelConvert.hpp"
 #include "AABBTreeLines.hpp"
 #include "ExPolygon.hpp"
 #include "Flow.hpp"
@@ -716,7 +717,16 @@ bool PrintObject::invalidate_state_by_config_options(
 
     std::vector<PrintObjectStep> steps;
     bool invalidated = false;
+    // ColorMix: the white core and the dual-wall split leave the top / bottom shells in color, so
+    // their segmentation (made in posSlice) depends on the shell settings.
+    const bool colormix_shells = (this->print()->colormix_slice_settings().core_extruder > 0 ||
+        std::any_of(this->print()->virtual_extruders().begin(), this->print()->virtual_extruders().end(),
+                    [](const FullSpectrum::VirtualExtruder &ve) { return !ve.inner_sequence.empty(); })) &&
+        ColorMix::is_colormix_object(*this->model_object(), this->print()->colormix_slice_settings(), this->print()->virtual_extruders());
     for (const t_config_option_key &opt_key : opt_keys) {
+        if (colormix_shells && (opt_key == "top_solid_layers" || opt_key == "bottom_solid_layers" ||
+                                opt_key == "top_solid_min_thickness" || opt_key == "bottom_solid_min_thickness"))
+            steps.emplace_back(posSlice);
         if (   opt_key == "brim_width"
             || opt_key == "brim_separation"
             || opt_key == "brim_type") {
@@ -2723,6 +2733,7 @@ void PrintObject::update_slicing_parameters() {
     if (!m_slicing_params.valid) {
         m_slicing_params = SlicingParameters::create_from_config(this->print()->config(), m_config, this->model_object()->max_z(),
                                                                  this->object_extruders(), this->print()->shrinkage_compensation());
+        m_slicing_params.set_layer_schedule(this->print()->colormix_slice_settings().layer_schedule);
     }
 }
 
@@ -2760,7 +2771,10 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
     if (object_max_z <= 0.f)
         object_max_z = (float)model_object.raw_bounding_box().size().z();
 
-    return SlicingParameters::create_from_config(print_config, object_config, object_max_z, object_extruders, object_shrinkage_compensation);
+    SlicingParameters params = SlicingParameters::create_from_config(print_config, object_config, object_max_z, object_extruders, object_shrinkage_compensation);
+    if (const Model *model = model_object.get_model(); model != nullptr)
+        params.set_layer_schedule(model->colormix.slice.layer_schedule);
+    return params;
 }
 
 // returns 0-based indices of extruders used to print the object (without brim, support and other helper extrusions)

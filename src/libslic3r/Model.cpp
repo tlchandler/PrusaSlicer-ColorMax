@@ -64,6 +64,7 @@ Model& Model::assign_copy(const Model &rhs)
     this->wipe_tower_vector = rhs.wipe_tower_vector;
     this->sla_workflow_uuid = rhs.sla_workflow_uuid;
     this->virtual_extruders = rhs.virtual_extruders;
+    this->colormix = rhs.colormix;
 
     return *this;
 }
@@ -89,6 +90,7 @@ Model& Model::assign_copy(Model &&rhs)
     this->wipe_tower_vector = rhs.wipe_tower_vector;
     this->sla_workflow_uuid = rhs.sla_workflow_uuid;
     this->virtual_extruders = std::move(rhs.virtual_extruders);
+    this->colormix = std::move(rhs.colormix);
 
     return *this;
 }
@@ -1100,6 +1102,7 @@ void ModelVolume::reset_extra_facets()
     this->seam_facets.reset();
     this->mm_segmentation_facets.reset();
     this->fuzzy_skin_facets.reset();
+    this->colormix_source_facets.reset();
 }
 
 
@@ -1462,6 +1465,7 @@ void ModelVolume::assign_new_unique_ids_recursive()
     seam_facets.set_new_unique_id();
     mm_segmentation_facets.set_new_unique_id();
     fuzzy_skin_facets.set_new_unique_id();
+    colormix_source_facets.set_new_unique_id();
 }
 
 void ModelVolume::rotate(double angle, Axis axis)

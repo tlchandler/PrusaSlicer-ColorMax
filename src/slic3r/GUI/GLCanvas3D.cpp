@@ -6216,6 +6216,7 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type)
         trafo.translate(s_multiple_beds.get_bed_translation(s_multiple_beds.get_active_bed()));
     }
 
+    m_volumes.set_colormax_original(colormax_original_active());
     GLShaderProgram* shader = wxGetApp().get_shader("gouraud");
     if (shader != nullptr) {
         shader->start_using();
@@ -6382,6 +6383,7 @@ void GLCanvas3D::_render_overlays()
     _render_undoredo_toolbar();
     _render_collapse_toolbar();
     _render_view_toolbar();
+    _render_colormax_view_toggle();
 
     if (m_layers_editing.last_object_id >= 0 && m_layers_editing.object_max_z() > 0.0f)
         m_layers_editing.render_overlay(*this);
@@ -6838,6 +6840,61 @@ void GLCanvas3D::_render_view_toolbar() const
     const float left = -0.5f * (float)cnv_size.get_width();
     view_toolbar.set_position(top, left);
     view_toolbar.render(*this);
+}
+
+bool GLCanvas3D::colormax_converted() const
+{
+    if (m_model == nullptr || this != wxGetApp().plater()->canvas3D() || !m_model->colormix.plate_json.empty() ||
+        m_model->colormix.options_json.find("\"applied_states\"") == std::string::npos)
+        return false;
+    for (const ModelObject* o : m_model->objects)
+        for (const ModelVolume* v : o->volumes)
+            if (v->has_colormix_source())
+                return true;
+    return false;
+}
+
+bool GLCanvas3D::colormax_original_active() const
+{
+    // Painting tools always show (and edit) the ColorMax painting.
+    return m_colormax_original_view && m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation && colormax_converted();
+}
+
+void GLCanvas3D::_render_colormax_view_toggle()
+{
+    if (wxGetApp().plater()->is_preview_shown() || m_gizmos.get_current_type() == GLGizmosManager::MmSegmentation || !colormax_converted())
+        return;
+    GLToolbar&  view_toolbar = wxGetApp().plater()->get_view_toolbar();
+    const Size  cnv_size     = get_canvas_size();
+    const float scale        = wxGetApp().imgui()->get_style_scaling();
+    // Right of the "3D editor / Preview" buttons, aligned with their bottom.
+    ImGuiPureWrap::set_next_window_pos(view_toolbar.get_width() + 8.0f * scale, float(cnv_size.get_height()) - 4.0f * scale, ImGuiCond_Always, 0.0f, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f * scale);
+    ImGuiPureWrap::begin("colormax_view_toggle", ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDecoration |
+                                                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    bool changed = false;
+    auto option = [&](const std::string& label, bool original, const std::string& tip) {
+        const bool active = m_colormax_original_view == original;
+        // The view shown: orange; the other one: gray.
+        ImGui::PushStyleColor(ImGuiCol_Button, active ? ImGuiPureWrap::COL_ORANGE_LIGHT : ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
+        if (ImGuiPureWrap::button(label) && !active) {
+            m_colormax_original_view = original;
+            changed = true;
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", tip.c_str());
+    };
+    option(_u8L("Original"), true, _u8L("The model's own colors, as it was designed (before ColorMax). Only the view changes."));
+    ImGui::SameLine();
+    option(_u8L("ColorMax"), false, _u8L("The colors ColorMax will print: each color of the model replaced by its mix, in the color "
+                                         "the mix is predicted to have."));
+    ImGuiPureWrap::end();
+    ImGui::PopStyleVar();
+    if (changed) {
+        set_as_dirty();
+        wxGetApp().imgui()->set_requires_extra_frame();
+    }
 }
 
 #if ENABLE_SHOW_CAMERA_TARGET

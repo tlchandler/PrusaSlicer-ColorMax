@@ -1023,6 +1023,11 @@ private:
     void _render_undoredo_toolbar();
     void _render_collapse_toolbar() const;
     void _render_view_toolbar() const;
+    // ColorMax: "Original / ColorMax" switch next to the view toolbar on a converted model.
+    bool colormax_converted() const;
+    bool colormax_original_active() const;
+    void _render_colormax_view_toggle();
+    bool m_colormax_original_view{ false };
 #if ENABLE_SHOW_CAMERA_TARGET
     void _render_camera_target();
     void _render_camera_target_validation_box();

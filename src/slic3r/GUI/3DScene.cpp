@@ -792,6 +792,26 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType type, bool disab
         m_mm_paint_cache.extruders_colors = extruders_colors;
         m_mm_paint_cache.volume_data.clear();
     }
+    // ColorMax "Original" view: converted parts show their painting from before the conversion, in
+    // the model's own colors (source slot s -> palette[s - 1]).
+    std::vector<ColorRGBA> source_palette;
+    if (m_colormax_original && !model_objects.empty() && model_objects.front()->get_model() != nullptr) {
+        const std::vector<std::string> &sc = model_objects.front()->get_model()->colormix.source_colors;
+        for (size_t s = 1; s < sc.size(); ++s) {
+            ColorRGBA c(0.5f, 0.5f, 0.5f, 1.0f);
+            if (!sc[s].empty())
+                decode_color(sc[s], c);
+            source_palette.push_back(c);
+        }
+    }
+    if (m_mm_paint_cache.source_colors != source_palette) {
+        // TriangleSelectorMmGui keeps a reference to its palette (m_mm_paint_cache.source_colors): drop
+        // the selectors built on the old one before it changes.
+        for (auto it = m_mm_paint_cache.volume_data.begin(); it != m_mm_paint_cache.volume_data.end();)
+            it = it->second.original ? m_mm_paint_cache.volume_data.erase(it) : std::next(it);
+        m_mm_paint_cache.source_colors = std::move(source_palette);
+    }
+    const bool colormax_original = !m_mm_paint_cache.source_colors.empty();
     auto time_now = std::chrono::system_clock::now();
 
 
@@ -808,7 +828,8 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType type, bool disab
         const int vol_idx = volume.first->volume_idx();
         const bool render_as_mmu_painted = is_render_as_mmu_painted_enabled && !volume.first->selected &&
             !volume.first->is_outside && volume.first->hover == GLVolume::HS_None && !volume.first->is_wipe_tower() && obj_idx >= 0 && vol_idx >= 0 &&
-            !model_objects[obj_idx]->volumes[vol_idx]->mm_segmentation_facets.empty() &&
+            (!model_objects[obj_idx]->volumes[vol_idx]->mm_segmentation_facets.empty() ||
+             (colormax_original && model_objects[obj_idx]->volumes[vol_idx]->has_colormix_source())) &&
             type != GLVolumeCollection::ERenderType::Transparent; // to filter out shells (not very nice)
         volume.first->set_render_color(true);
 
@@ -856,13 +877,20 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType type, bool disab
             ObjectID vol_id = model_volume.id();
             auto it = m_mm_paint_cache.volume_data.find(vol_id);
             GUI::TriangleSelectorMmGui* ts = nullptr;
-            uint64_t timestamp = model_volume.mm_segmentation_facets.timestamp();
-            if (it == m_mm_paint_cache.volume_data.end() || it->second.extruder_id != extruder_idx || timestamp != it->second.mm_timestamp) {
-                auto ts_uptr = std::make_unique<GUI::TriangleSelectorMmGui>(model_volume.mesh(), m_mm_paint_cache.extruders_colors, m_mm_paint_cache.extruders_colors[extruder_idx]);
+            const bool original = colormax_original && model_volume.has_colormix_source();
+            const FacetsAnnotation& facets = original ? model_volume.colormix_source_facets : model_volume.mm_segmentation_facets;
+            uint64_t timestamp = facets.timestamp();
+            if (it == m_mm_paint_cache.volume_data.end() || it->second.extruder_id != extruder_idx || timestamp != it->second.mm_timestamp ||
+                it->second.original != original) {
+                // The selector keeps a reference to the palette: the cache's own vectors outlive it.
+                const std::vector<ColorRGBA>& palette = original ? m_mm_paint_cache.source_colors : m_mm_paint_cache.extruders_colors;
+                const ColorRGBA default_color = original ? ColorRGBA(0.5f, 0.5f, 0.5f, 1.0f) : m_mm_paint_cache.extruders_colors[extruder_idx];
+                auto ts_uptr = std::make_unique<GUI::TriangleSelectorMmGui>(model_volume.mesh(), palette, default_color);
                 ts = ts_uptr.get();
-                ts->deserialize(model_volume.mm_segmentation_facets.get_data(), true);
+                ts->deserialize(facets.get_data(), true);
                 ts->request_update_render_data();
-                m_mm_paint_cache.volume_data[vol_id] = MMPaintCachePerVolume{ extruder_idx, std::move(ts_uptr), std::chrono::system_clock::now(), timestamp };
+                MMPaintCachePerVolume entry{ extruder_idx, original, std::move(ts_uptr), std::chrono::system_clock::now(), timestamp };
+                m_mm_paint_cache.volume_data[vol_id] = std::move(entry);
             }
             else {
                 ts = it->second.triangle_selector_mm.get();

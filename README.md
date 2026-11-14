@@ -1,3 +1,53 @@
+# PrusaSlicer-ColorMax
+
+**PrusaSlicer-ColorMax prints full-color models on a multi-tool printer using just a handful of
+filaments.** Thin layers of different colors, printed one after another, blend into a new color when
+seen from a normal distance: a few layers of Cyan and Yellow look green, Magenta and White look pink.
+ColorMax takes a colored model (a painted or multi-color 3MF from PrusaSlicer, Bambu Studio, OrcaSlicer, ...), works out a layer recipe for every
+color in it, shows you how each color will print, and repaints the model so PrusaSlicer prints those
+recipes. With the five Prusament PLA ColorMix colors and two walls of different recipes it can print
+roughly 2,000 visibly different colors.
+
+To get the colors right, ColorMax learns how your spools actually mix on your printer: you print a
+calibration plate of color swatches, scan it on a flatbed scanner, and ColorMax measures them. The
+Prusament PLA ColorMix set ships with a reference calibration; with your own, predicted colors are
+typically within about 2 ΔE of the print (hard to tell apart).
+
+More: [what ColorMax does and how](doc/ColorMax.md) - [changelog](COLORMAX_CHANGELOG.md).
+
+Three things to know:
+
+1. **It is vibe-coded.** It is written with an AI coding assistant, directed and reviewed by someone
+   who understands code, with automated tests for what can be tested. But it is vibe-coded: treat it
+   as experimental, and check the preview before you print something that matters.
+
+2. **It builds on the ideas of [iDither](https://idither.com), not on its code.** Mixing colors by
+   alternating thin layers was pioneered by [Full Spectrum](https://github.com/ratdoux/OrcaSlicer-FullSpectrum)
+   (an open-source OrcaSlicer fork). Prusa then brought layer color mixing into PrusaSlicer through
+   [virtual extruders and ColorMix](https://blog.prusa3d.com/our-new-open-source-colormix-model-in-prusaslicer-and-easyprint_136079/).
+   iDither went its own way with these ideas (calibrated recipes, different inner and outer walls), and
+   ColorMax carries them forward. We don't use iDither's code in any way. We are uncomfortable with iDither for a variety of reasons, including:
+   - It isn't open source. Its license is proprietary and its source is private, so nobody can check
+     how it works, fix it or build on it.  But it is built on the back of many other open source projects.
+   - It puts a website in the middle of your workflow. You take your model out of the slicer to
+     idither.com (the analysis runs in your browser; downloading the result needs an account made with
+     a referral code), then bring a project file back into Bambu Studio or Snapmaker Orca. The site can
+     change its terms or disappear at any time.
+   - Some elements of it cost (the app).
+
+   ColorMax runs entirely inside PrusaSlicer on your computer, and all of its code is here, under the
+   same open-source license as PrusaSlicer.
+
+3. **It is a fork of PrusaSlicer 2.9.7**, the current stable release. GitHub shows it as thousands of
+   commits "behind" Prusa's `master` branch: that branch is PrusaSlicer 3.0, still in alpha. ColorMax
+   will be ported to PrusaSlicer 3.0 once 3.0 is stable.
+
+---
+
+*Everything below this line is Prusa's original PrusaSlicer README.*
+
+---
+
 
 ![PrusaSlicer logo](/resources/icons/PrusaSlicer.png?raw=true)
 

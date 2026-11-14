@@ -402,20 +402,25 @@ private:
 
     struct MMPaintCachePerVolume {
         size_t extruder_id;
+        bool   original{ false };   // ColorMax "Original" view: the painting before the conversion
         std::unique_ptr<GUI::TriangleSelectorMmGui> triangle_selector_mm;
         std::chrono::system_clock::time_point time_used;
         uint64_t mm_timestamp;
     };
     struct MMPaintCache {
         std::vector<ColorRGBA> extruders_colors;
+        std::vector<ColorRGBA> source_colors;   // ColorMax source palette (state 1 first)
         std::map<ObjectID, MMPaintCachePerVolume> volume_data;
     };
     mutable MMPaintCache m_mm_paint_cache;
+    // ColorMax: draw converted parts with the painting and colors they had before the conversion.
+    bool m_colormax_original{ false };
 
 public:
     GLVolumePtrs volumes;
 
     GLVolumeCollection() { set_default_slope_normal_z(); }
+    void set_colormax_original(bool on) { m_colormax_original = on; }
     ~GLVolumeCollection() { clear(); }
 
     std::vector<int> load_object(

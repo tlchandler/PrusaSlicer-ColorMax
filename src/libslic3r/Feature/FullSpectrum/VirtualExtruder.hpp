@@ -18,6 +18,8 @@ using ExPolygons = std::vector<ExPolygon>;
 namespace Slic3r::FullSpectrum {
 
 inline constexpr size_t MAX_BLEND_COMPONENTS = 3;
+// Virtual extruders with an explicit layer `sequence` (ColorMix words, dual walls) may use more.
+inline constexpr size_t MAX_SEQUENCE_COMPONENTS = 8;
 
 struct VirtualExtruderComponent
 {
@@ -86,6 +88,12 @@ struct VirtualExtruder
     std::optional<std::string> color;
     VirtualExtruderComponents components;
     std::optional<VirtualExtruderGradient> gradient;
+    // ColorMax engine: explicit layer word (1-based physical extruder IDs). When non-empty, layer L
+    // uses sequence[L % sequence.size()] instead of the cycle derived from the component ratios.
+    std::vector<unsigned int> sequence;
+    // ColorMax engine, dual walls: layer word of the inner wall (1-based physical extruder IDs).
+    // When non-empty, the outer ring of the region follows `sequence` and the rest `inner_sequence`.
+    std::vector<unsigned int> inner_sequence;
 
     Type type() const
     {
@@ -111,7 +119,9 @@ struct VirtualExtruder
         return this->id == other.id
             && this->color == other.color
             && this->components == other.components
-            && this->gradient == other.gradient;
+            && this->gradient == other.gradient
+            && this->sequence == other.sequence
+            && this->inner_sequence == other.inner_sequence;
     }
 
     bool operator!=(const VirtualExtruder& other) const
